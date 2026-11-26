@@ -980,6 +980,131 @@ static bool test_dmabuf_reconcile_and_router_pricing() {
   return true;
 }
 
+/* =========================================================================
+ * Test 7: Real Linux DMA-BUF Sync/Fence Engine + OpenBuenos & Vulkan Adapters
+ * ========================================================================= */
+static bool test_real_backend_adapters_and_dmabuf_sync() {
+  fs_config_t cfg = fs_config_default();
+  cfg.mock_mode   = 1;
+  cfg.profile     = FS_PROFILE_PIXEL10_LAGUNA;
+
+  fs_context_t* ctx = nullptr;
+  CHECK(fs_context_create(&cfg, &ctx) == FS_OK);
+
+  /* Register optional real backend adapters (with host fallback for offline CI) */
+  fs_openbuenos_config_t ob_cfg = fs_openbuenos_config_default();
+  ob_cfg.allow_mock_fallback    = 1;
+  CHECK(fs_backend_register_openbuenos(ctx, &ob_cfg) == FS_OK);
+
+  fs_vulkan_dmabuf_config_t vk_cfg = fs_vulkan_dmabuf_config_default();
+  vk_cfg.allow_mock_fallback       = 1;
+  vk_cfg.require_linear_layout     = 1;
+  CHECK(fs_backend_register_vulkan_dmabuf(ctx, &vk_cfg) == FS_OK);
+
+  /* Verify fail-closed rejection when tiled GPU buffer is handed directly to linear TPU */
+  fs_buf_attr_t tiled_attr = fs_buf_attr_default(FS_DEV_GPU_VK);
+  tiled_attr.layout        = FS_LAYOUT_TILED;
+  tiled_attr.layout_mask   = FS_LAYOUT_BIT(FS_LAYOUT_TILED);
+  fs_dmabuf_t* b_tiled     = nullptr;
+  CHECK(fs_buffer_alloc_reconciled(ctx, 4096u, &tiled_attr, 1u, FS_DEV_GPU_VK, FS_BUF_ZERO_INIT,
+                                   &b_tiled, nullptr) == FS_OK);
+  CHECK(fs_buffer_handoff(ctx, b_tiled, FS_DEV_GPU_VK, FS_DEV_TPU, nullptr) == FS_ERR_UNSUPPORTED);
+  CHECK(b_tiled->owner_dev == FS_DEV_GPU_VK); /* Atomic rollback on failure */
+  fs_buffer_release(ctx, b_tiled);
+
+  /* Reconciled 3-engine non-coherent linear zero-copy pipeline (GPU -> CPU -> TPU) */
+  fs_buf_attr_t attrs[3] = {
+      fs_buf_attr_default(FS_DEV_GPU_VK),
+      fs_buf_attr_default(FS_DEV_TPU),
+      fs_buf_attr_default(FS_DEV_CPU_NEON),
+  };
+  const uint32_t M_PRE = 64u, K = 32u, N = 32u;
+  fs_dmabuf_t *b_in = nullptr, *b_w = nullptr, *b_pre = nullptr, *b_rms = nullptr, *b_dec = nullptr;
+  CHECK(fs_buffer_alloc_reconciled(ctx, M_PRE * K * sizeof(float), attrs, 3u, FS_DEV_CPU_NEON, 0u,
+                                   &b_in, nullptr) == FS_OK);
+  CHECK(fs_buffer_alloc_reconciled(ctx, N * K * sizeof(float), attrs, 3u, FS_DEV_GPU_VK,
+                                   FS_BUF_IMMUTABLE_WEIGHT, &b_w, nullptr) == FS_OK);
+  CHECK(fs_buffer_alloc_reconciled(ctx, M_PRE * N * sizeof(float), attrs, 3u, FS_DEV_GPU_VK, 0u,
+                                   &b_pre, nullptr) == FS_OK);
+  CHECK(fs_buffer_alloc_reconciled(ctx, M_PRE * N * sizeof(float), attrs, 3u, FS_DEV_CPU_NEON, 0u,
+                                   &b_rms, nullptr) == FS_OK);
+  CHECK(fs_buffer_alloc_reconciled(ctx, N * sizeof(float), attrs, 3u, FS_DEV_TPU, 0u, &b_dec,
+                                   nullptr) == FS_OK);
+
+  auto* pin = static_cast<float*>(b_in->host_ptr);
+  auto* pw  = static_cast<float*>(b_w->host_ptr);
+  for (uint32_t i = 0; i < M_PRE * K; ++i) pin[i] = std::sin(static_cast<float>(i) * 0.04f);
+  for (uint32_t i = 0; i < N * K; ++i) pw[i]      = std::cos(static_cast<float>(i) * 0.06f) * 0.25f;
+
+  /* Explicit DMA_BUF_IOCTL_SYNC + sync_file export */
+  CHECK(fs_buffer_dma_sync(ctx, b_in, static_cast<uint32_t>(FS_DMA_SYNC_END) |
+                                          static_cast<uint32_t>(FS_DMA_SYNC_RW)) == FS_OK);
+  CHECK(b_in->dma_sync_count == 1u);
+  fs_fence_t exp_fence = fs_fence_init(FS_DEV_CPU_NEON);
+  CHECK(fs_buffer_export_sync_file(ctx, b_in, static_cast<uint32_t>(FS_DMA_SYNC_RW), &exp_fence) ==
+        FS_OK);
+  CHECK(exp_fence.state == FS_FENCE_SIGNALED);
+  fs_fence_close(&exp_fence);
+
+  fs_op_desc_t ops[3];
+  std::memset(ops, 0, sizeof(ops));
+  ops[0].type = FS_OP_PREFILL_GEMM; ops[0].phase = FS_PHASE_PREFILL;
+  ops[0].m_dim = M_PRE; ops[0].k_dim = K; ops[0].n_dim = N;
+  ops[0].act_dtype = FS_DTYPE_F32; ops[0].weight_dtype = FS_DTYPE_F32;
+  ops[0].input_a = b_in; ops[0].input_b = b_w; ops[0].output = b_pre;
+
+  ops[1].type = FS_OP_RMS_NORM; ops[1].phase = FS_PHASE_CONTROL;
+  ops[1].m_dim = M_PRE; ops[1].n_dim = N; ops[1].aux_param = 1e-5f;
+  ops[1].act_dtype = FS_DTYPE_F32;
+  ops[1].input_a = b_pre; ops[1].output = b_rms;
+
+  ops[2].type = FS_OP_DECODE_GEMV; ops[2].phase = FS_PHASE_DECODE;
+  ops[2].m_dim = 1u; ops[2].k_dim = K; ops[2].n_dim = N;
+  ops[2].act_dtype = FS_DTYPE_F32; ops[2].weight_dtype = FS_DTYPE_F32;
+  ops[2].input_a = b_rms; ops[2].input_b = b_w; ops[2].output = b_dec;
+
+  fs_plan_t* plan = nullptr;
+  CHECK(fs_plan_create(ctx, ops, 3u, &plan) == FS_OK);
+  CHECK(plan->steps[0].assigned_dev == FS_DEV_GPU_VK);
+  CHECK(plan->steps[1].assigned_dev == FS_DEV_CPU_NEON);
+  CHECK(plan->steps[2].assigned_dev == FS_DEV_TPU);
+  CHECK(fs_execute_plan(ctx, plan, ops, 3u) == FS_OK);
+
+  /* Verify bit-exact parity + non-coherent sync telemetry + zero fallback copies */
+  std::vector<float> r_pre(M_PRE * N), r_rms(M_PRE * N), r_dec(N), ones(N, 1.0f);
+  ref_gemm_f32(pin, pw, r_pre.data(), M_PRE, K, N);
+  ref_rms_norm(r_pre.data(), ones.data(), r_rms.data(), M_PRE, N, 1e-5f);
+  ref_gemm_f32(r_rms.data(), pw, r_dec.data(), 1u, K, N);
+
+  fs_parity_t par;
+  CHECK(fs_compute_parity_f32(static_cast<const float*>(b_dec->host_ptr), r_dec.data(), N, &par) ==
+        FS_OK);
+  CHECK(par.exact_match == 1);
+
+  fs_telemetry_t tel;
+  CHECK(fs_context_get_telemetry(ctx, &tel) == FS_OK);
+  CHECK(tel.fallback_copies == 0u);
+  CHECK(tel.zero_copy_handoffs >= 3u);
+  CHECK(tel.dma_sync_calls >= 4u);
+  CHECK(tel.sync_file_exports >= 1u);
+  CHECK(b_rms->tpu_iova != 0u);
+  CHECK(b_pre->vk_device_addr != 0u);
+
+  /* Direct GPU -> TPU non-coherent handoff triggers 2 boundary sync calls (END + START) */
+  fs_dmabuf_t* b_direct = nullptr;
+  CHECK(fs_buffer_alloc_reconciled(ctx, 4096u, attrs, 3u, FS_DEV_GPU_VK, FS_BUF_ZERO_INIT,
+                                   &b_direct, nullptr) == FS_OK);
+  fs_fence_t f_dir = fs_fence_init(FS_DEV_GPU_VK);
+  CHECK(fs_buffer_handoff(ctx, b_direct, FS_DEV_GPU_VK, FS_DEV_TPU, &f_dir) == FS_OK);
+  CHECK(b_direct->dma_sync_count == 2u);
+  fs_fence_close(&f_dir);
+  fs_buffer_release(ctx, b_direct);
+
+  fs_plan_destroy(plan);
+  fs_context_destroy(ctx);
+  return true;
+}
+
 int main() {
   struct {
     const char* name;
@@ -991,6 +1116,7 @@ int main() {
       {"routing_overrides_continuity_and_degradation", test_routing_overrides_continuity_and_degradation},
       {"custom_vtable_and_ggml_seam", test_custom_vtable_and_ggml_seam},
       {"dmabuf_reconcile_and_router_pricing", test_dmabuf_reconcile_and_router_pricing},
+      {"real_backend_adapters_and_dmabuf_sync", test_real_backend_adapters_and_dmabuf_sync},
   };
 
   int passed = 0;
