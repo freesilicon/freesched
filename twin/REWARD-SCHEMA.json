@@ -69,6 +69,42 @@
       "type": ["number", "null"],
       "minimum": 0.0
     },
+    "bytes_moved": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total modeled DRAM/SRAM traffic in bytes for roofline SOL calculation."
+    },
+    "flops": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total arithmetic operations (FLOPs / INT8 OPs) for roofline SOL calculation."
+    },
+    "sol_floor_us": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "description": "Theoretical Speed-of-Light roofline floor in microseconds: max(bytes_moved / peak_bw, flops / peak_ops)."
+    },
+    "twin_pred_us": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "description": "Digital Twin predicted hardware execution time in microseconds."
+    },
+    "measured_hw_us": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "description": "Optional real silicon measured execution time in microseconds when hardware proof exists."
+    },
+    "pct_sol": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Speed-of-Light attainment ratio: sol_floor_us / effective_us (in [0.0, 1.0])."
+    },
+    "twin_error_pct": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "description": "Relative twin prediction error against real silicon: abs(twin_pred_us - measured_hw_us) / measured_hw_us."
+    },
     "eval_ms": {
       "type": "number",
       "minimum": 0.0
