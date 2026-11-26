@@ -59,4 +59,12 @@ if (FREESCHED_BUILD_TESTS)
   target_link_libraries(bench_heterogeneous PRIVATE freesched)
   target_compile_features(bench_heterogeneous PRIVATE cxx_std_17)
   target_compile_options(bench_heterogeneous PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+
+  find_package(Python3 COMPONENTS Interpreter)
+  if (Python3_FOUND)
+    add_test(
+      NAME test_twin
+      COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p "test_*.py" -v
+    )
+  endif()
 endif()

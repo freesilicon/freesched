@@ -16,6 +16,8 @@
 |  freesilicon/freesched  (Layer 2: Scheduler, DMA-BUF & ggml Adapter)  |
 |  - include/freesched.h         (Frozen pure C11 / C++17 ABI)          |
 |  - include/ggml_freesilicon.h  (Thin ggml backend adapter seam)       |
+|  - twin/freesilicon-twin       (Unified Computer 2 Digital Twin CLI)  |
+|  - twin/REWARD-SCHEMA.json     (freesilicon.twin.v1 GRPO RL contract) |
 |  - Zero-copy DMA-BUF ownership + sync_file fence state machine        |
 |  - Cost-model router + pluggable fs_backend_ops_t vtable              |
 +------------------+----------------------------------+-----------------+
@@ -69,8 +71,25 @@ FREESCHED_MOCK=1 ./build-cmake/bench_heterogeneous
 1. Strict `-std=c11 -Wall -Wextra -Werror` and `-std=c++17 -Wall -Wextra -Werror` syntax checks on `include/freesched.h` and `include/ggml_freesilicon.h`.
 2. Pure C11 ABI suite (`test_c11_abi`).
 3. Full C++17 unit & integration suite (`test_freesched`) covering topology, `DMA-BUF` ownership/race detection, heterogeneous prefill/attention/decode routing, bit-exact FP32/FP16/Q8_0/Q4_0 parity, graceful degradation, custom backend vtables, and the `ggml_freesilicon` adapter.
-4. Heterogeneous laptop benchmark (`bench_heterogeneous`).
+4. Heterogeneous laptop benchmark (`bench_heterogeneous`) + `twin/freesilicon-twin` Digital Twin suite & `>= 1,000 evals/min` throughput gate.
 5. Clean-room boundary audit (`./scripts/clean-room-audit.sh`).
+
+## Computer 2 Digital Twin (`twin/`)
+
+`freesched` ships with the unified Computer 2 Digital Twin CLI ([twin/freesilicon-twin](twin/freesilicon-twin)) and `freesilicon.twin.v1` GRPO/RL reward contract ([twin/REWARD-SCHEMA.json](twin/REWARD-SCHEMA.json)):
+
+```bash
+# Run offline verification across built-in FreeSched + any sibling FreePVR / FreeTile twins
+./twin/freesilicon-twin self-test
+
+# Evaluate mixed JSONL batches and validate against REWARD-SCHEMA.json
+cat <<'EOF' | ./twin/freesilicon-twin eval --jsonl | ./twin/freesilicon-twin validate-verdict -
+{"domain":"freesched","target":"laguna","workload":"prefill-decode-attn","m_prefill":512,"m_decode":1}
+{"domain":"freesched","target":"malibu","workload":"prefill-decode-sme2","m_prefill":512,"m_decode":1}
+EOF
+```
+
+See [twin/README.md](twin/README.md) for `FREEPVR_TWIN_DIR` and `FREETILE_TWIN_BIN` plugin discovery.
 
 ## License
 

@@ -1,0 +1,1160 @@
+#!/usr/bin/env python3
+"""
+freesilicon-twin — Unified FreeSilicon Computer 2 Digital Twin CLI
+
+Copyright 2026 FreeSilicon Contributors
+SPDX-License-Identifier: Apache-2.0
+
+Single offline verifier & GRPO RL reward oracle spanning:
+  - FreeSched (Layer 2):  Cross-accelerator GPU + EdgeTPU + CPU/SME2 DMA-BUF scheduler
+  - FreePVR Volcanic GPU: freecs-validate (CSB/FW-ABI) & freeusc-sim (128-lane USC)
+  - FreeTPU / FreeTile:   freetile-twin (BUENOS_A0 / Malibu SRAM, .dgc0, 0x640 splines)
+
+All verdicts conform to REWARD-SCHEMA.json (schema_version: "freesilicon.twin.v1").
+Zero external dependencies (Python 3 stdlib only). 100% offline.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+TWIN_DIR = Path(__file__).resolve().parent
+REPO_ROOT = TWIN_DIR.parent
+SCHEMA_PATH = TWIN_DIR / "REWARD-SCHEMA.json"
+
+REQUIRED_VERDICT_KEYS = (
+    "schema_version",
+    "domain",
+    "target",
+    "workload",
+    "pass",
+    "reward",
+    "fault_reason",
+    "eval_ms",
+    "checks",
+)
+VALID_DOMAINS = {"freecs", "freeusc", "freetile", "dgc0", "freesched"}
+VALID_TARGETS = {
+    "volcanic-dxt-48-1536",
+    "volcanic-cxtp-48-1536",
+    "buenos-a0",
+    "malibu",
+    "laguna",
+    "host-mock",
+}
+
+# Hardware cost profiles mirroring src/fs_topology.cpp
+SCHED_PROFILES: Dict[str, Dict[str, Any]] = {
+    "laguna": {
+        "soc": "laguna",
+        "ram_bytes": 16 * 1024**3,
+        "sram_limit_bytes": 2048 * 1024,
+        "prefill_m_threshold": 32,
+        "sme2": False,
+        "tpu_tops": 12.0,
+        "tpu_watts": 1.8,
+        "tpu_launch_us": 18.0,
+        "gpu_gflops": 2400.0,
+        "gpu_watts": 4.5,
+        "gpu_launch_us": 65.0,
+        "cpu_gflops": 240.0,
+        "cpu_watts": 2.6,
+        "cpu_launch_us": 3.0,
+        "mem_bw_gbps": 48.0,
+        "handoff_us": 8.0,
+    },
+    "malibu": {
+        "soc": "malibu",
+        "ram_bytes": 16 * 1024**3,
+        "sram_limit_bytes": 4096 * 1024,
+        "prefill_m_threshold": 32,
+        "sme2": True,
+        "tpu_tops": 24.0,
+        "tpu_watts": 1.6,
+        "tpu_launch_us": 14.0,
+        "gpu_gflops": 3600.0,
+        "gpu_watts": 4.2,
+        "gpu_launch_us": 55.0,
+        "cpu_gflops": 1200.0,
+        "cpu_watts": 2.2,
+        "cpu_launch_us": 3.5,
+        "mem_bw_gbps": 68.0,
+        "handoff_us": 6.0,
+    },
+    "host-mock": {
+        "soc": "host-mock",
+        "ram_bytes": 16 * 1024**3,
+        "sram_limit_bytes": 4096 * 1024,
+        "prefill_m_threshold": 32,
+        "sme2": True,
+        "tpu_tops": 24.0,
+        "tpu_watts": 1.6,
+        "tpu_launch_us": 14.0,
+        "gpu_gflops": 3600.0,
+        "gpu_watts": 4.2,
+        "gpu_launch_us": 55.0,
+        "cpu_gflops": 1200.0,
+        "cpu_watts": 2.2,
+        "cpu_launch_us": 3.5,
+        "mem_bw_gbps": 68.0,
+        "handoff_us": 6.0,
+    },
+}
+
+
+def validate_verdict(verdict: Any) -> List[str]:
+    """Strictly validate a verdict dict against REWARD-SCHEMA.json (freesilicon.twin.v1)."""
+    errors: List[str] = []
+    if not isinstance(verdict, dict):
+        return ["verdict must be a JSON object"]
+
+    for key in REQUIRED_VERDICT_KEYS:
+        if key not in verdict:
+            errors.append(f"missing required key: {key}")
+
+    if verdict.get("schema_version") != "freesilicon.twin.v1":
+        errors.append(f"invalid schema_version: {verdict.get('schema_version')!r}")
+    if verdict.get("domain") not in VALID_DOMAINS:
+        errors.append(f"invalid domain: {verdict.get('domain')!r}")
+    if verdict.get("target") not in VALID_TARGETS:
+        errors.append(f"invalid target: {verdict.get('target')!r}")
+    wl = verdict.get("workload")
+    if not isinstance(wl, str) or not wl:
+        errors.append("workload must be a non-empty string")
+    if not isinstance(verdict.get("pass"), bool):
+        errors.append("pass must be boolean")
+
+    reward = verdict.get("reward")
+    if not isinstance(reward, (int, float)) or isinstance(reward, bool):
+        errors.append("reward must be a number")
+    elif not (-1.0 <= float(reward) <= 1.0):
+        errors.append(f"reward out of [-1.0, 1.0]: {reward}")
+
+    eval_ms = verdict.get("eval_ms")
+    if not isinstance(eval_ms, (int, float)) or isinstance(eval_ms, bool) or float(eval_ms) < 0.0:
+        errors.append(f"eval_ms must be a non-negative number: {eval_ms!r}")
+
+    fr = verdict.get("fault_reason")
+    if fr is not None and not isinstance(fr, str):
+        errors.append("fault_reason must be string or null")
+    if verdict.get("pass") is True and fr is not None:
+        errors.append("passing verdict must have fault_reason == null")
+    if verdict.get("pass") is False and (not isinstance(fr, str) or not fr):
+        errors.append("failing verdict must provide non-empty fault_reason")
+
+    for num_key in ("nmse", "max_abs_err", "est_hw_us"):
+        if num_key in verdict and verdict[num_key] is not None:
+            v = verdict[num_key]
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or float(v) < 0.0:
+                errors.append(f"{num_key} must be non-negative number or null")
+
+    for int_key in ("sram_bytes", "sram_limit_bytes"):
+        if int_key in verdict and verdict[int_key] is not None:
+            v = verdict[int_key]
+            if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                errors.append(f"{int_key} must be non-negative integer or null")
+
+    if not isinstance(verdict.get("checks"), dict):
+        errors.append("checks must be an object")
+
+    diags = verdict.get("diagnostics")
+    if diags is not None:
+        if not isinstance(diags, list):
+            errors.append("diagnostics must be an array")
+        else:
+            for idx, d in enumerate(diags):
+                if not isinstance(d, dict):
+                    errors.append(f"diagnostics[{idx}] must be an object")
+                    continue
+                for dk in ("code", "severity", "message"):
+                    if dk not in d or not isinstance(d[dk], str):
+                        errors.append(f"diagnostics[{idx}].{dk} must be a string")
+                if d.get("severity") not in {"error", "warning", "info"}:
+                    errors.append(f"diagnostics[{idx}].severity invalid: {d.get('severity')!r}")
+
+    return errors
+
+
+def find_freepvr_dir(explicit: Optional[str] = None) -> Optional[Path]:
+    """Locate FreePVR twin directory via flag, FREEPVR_TWIN_DIR, or portable sibling paths."""
+    candidates: List[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    env_dir = os.environ.get("FREEPVR_TWIN_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    candidates.extend(
+        (
+            TWIN_DIR / "freepvr-twin",
+            REPO_ROOT.parent / "freepvr" / "twin",
+            REPO_ROOT.parent / "freepvr" / "freepvr-twin",
+            REPO_ROOT.parent / "freepvr",
+        )
+    )
+    for c in candidates:
+        if (c / "freecs-validate").is_file() and (c / "freeusc-sim").is_file():
+            return c.resolve()
+    return None
+
+
+def find_freetile_bin(explicit: Optional[str] = None) -> Optional[Path]:
+    """Locate freetile-twin binary via flag, FREETILE_TWIN_BIN, PATH, or portable sibling paths."""
+    candidates: List[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    env_bin = os.environ.get("FREETILE_TWIN_BIN")
+    if env_bin:
+        candidates.append(Path(env_bin))
+    which_bin = shutil.which("freetile-twin")
+    if which_bin:
+        candidates.append(Path(which_bin))
+    candidates.extend(
+        (
+            TWIN_DIR / "bin" / "freetile-twin",
+            TWIN_DIR / "freetile-twin",
+            REPO_ROOT.parent / "freetpu" / "build" / "freetile-twin",
+            REPO_ROOT.parent / "freetpu" / "freetile" / "build" / "freetile-twin",
+        )
+    )
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return c.resolve()
+    return None
+
+
+def find_freesched_bench_bin(explicit: Optional[str] = None) -> Optional[Path]:
+    """Locate compiled freesched bench_heterogeneous binary if built."""
+    candidates: List[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    env_bin = os.environ.get("FREESCHED_BENCH_BIN")
+    if env_bin:
+        candidates.append(Path(env_bin))
+    candidates.extend(
+        (
+            REPO_ROOT / "build" / "bench_heterogeneous",
+            REPO_ROOT / "build-cmake" / "bench_heterogeneous",
+        )
+    )
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return c.resolve()
+    return None
+
+
+def _run_passthrough(cmd: List[str]) -> int:
+    return subprocess.run(cmd).returncode
+
+
+def _eval_freesched_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate a Layer 2 freesched cross-accelerator schedule candidate deterministically."""
+    t0 = time.perf_counter()
+    target = str(item.get("target", "laguna"))
+    if target == "buenos-a0":
+        target = "laguna"
+    workload = str(item.get("workload", "prefill-decode-attn"))
+
+    prof = SCHED_PROFILES.get(target)
+    if prof is None:
+        return {
+            "schema_version": "freesilicon.twin.v1",
+            "domain": "freesched",
+            "target": "laguna",
+            "workload": workload,
+            "pass": False,
+            "reward": -1.0,
+            "nmse": None,
+            "max_abs_err": None,
+            "sram_bytes": None,
+            "sram_limit_bytes": None,
+            "est_hw_us": None,
+            "eval_ms": round((time.perf_counter() - t0) * 1000.0, 4),
+            "fault_reason": f"INVALID_TARGET: {target}",
+            "diagnostics": [
+                {
+                    "code": "INVALID_TARGET",
+                    "severity": "error",
+                    "offset": None,
+                    "field": "target",
+                    "message": f"Unsupported freesched target {target!r}",
+                }
+            ],
+            "checks": {"target_valid": False},
+        }
+
+    m_prefill = int(item.get("m_prefill", 512))
+    m_decode = int(item.get("m_decode", 1))
+    k_dim = int(item.get("k", 64))
+    n_dim = int(item.get("n", 64))
+    h_dim = int(item.get("h", 128))
+    gpu_online = bool(item.get("gpu_online", True))
+    tpu_online = bool(item.get("tpu_online", True))
+    fallback_copies = int(item.get("fallback_copies", 0))
+    ownership_race = bool(item.get("ownership_race", False))
+    require_zero_copy = bool(item.get("require_zero_copy", True))
+    nmse = float(item.get("nmse", 0.0))
+    max_abs_err = float(item.get("max_abs_err", 0.0))
+
+    threshold = int(item.get("prefill_m_threshold", prof["prefill_m_threshold"]))
+    sram_limit = int(prof["sram_limit_bytes"])
+    # Working-set SRAM footprint estimate for active decode tile + SwiGLU scratch
+    sram_bytes = int(item.get("sram_bytes", (m_decode * (k_dim + h_dim + n_dim) * 4) + (h_dim * k_dim)))
+
+    # Routing decisions matching src/fs_router.cpp
+    if m_prefill >= threshold and gpu_online:
+        prefill_dev = "GPU_VK"
+    elif tpu_online:
+        prefill_dev = "TPU"
+    else:
+        prefill_dev = "CPU_SME2" if prof["sme2"] else "CPU_NEON"
+
+    attn_dev = "CPU_SME2" if prof["sme2"] else "CPU_NEON"
+
+    if tpu_online:
+        decode_dev = "TPU"
+    elif gpu_online and m_decode >= threshold:
+        decode_dev = "GPU_VK"
+    else:
+        decode_dev = "CPU_SME2" if prof["sme2"] else "CPU_NEON"
+
+    # Estimate roofline hardware latency
+    prefill_flops = 2.0 * max(m_prefill, 1) * k_dim * n_dim
+    decode_flops = 2.0 * max(m_decode, 1) * (k_dim * n_dim + 2.0 * k_dim * h_dim + h_dim * n_dim)
+    gpu_peak = prof["gpu_gflops"] * 1e9
+    tpu_peak = prof["tpu_tops"] * 1e12
+    cpu_peak = prof["cpu_gflops"] * 1e9
+
+    def _stage_us(dev: str, flops: float) -> float:
+        if dev == "GPU_VK":
+            return (flops / gpu_peak) * 1e6 + prof["gpu_launch_us"]
+        if dev == "TPU":
+            return (flops / tpu_peak) * 1e6 + prof["tpu_launch_us"]
+        return (flops / cpu_peak) * 1e6 + prof["cpu_launch_us"]
+
+    handoffs = (1 if prefill_dev != attn_dev else 0) + (1 if attn_dev != decode_dev else 0)
+    est_hw_us = (
+        _stage_us(prefill_dev, prefill_flops)
+        + _stage_us(attn_dev, 6.0 * max(m_prefill, 1) * n_dim)
+        + _stage_us(decode_dev, decode_flops)
+        + handoffs * prof["handoff_us"]
+    )
+
+    diagnostics: List[Dict[str, Any]] = []
+    fault_reason: Optional[str] = None
+    reward = 0.0
+
+    checks = {
+        "zero_copy_dmabuf": fallback_copies == 0,
+        "ownership_invariant": not ownership_race,
+        "sram_fit": sram_bytes <= sram_limit,
+        "numerical_parity": (not math.isnan(nmse)) and (not math.isnan(max_abs_err)) and nmse <= 1e-4,
+        "prefill_dev": prefill_dev,
+        "attn_dev": attn_dev,
+        "decode_dev": decode_dev,
+        "zero_copy_handoffs": handoffs if fallback_copies == 0 else 0,
+        "fallback_copies": fallback_copies,
+        "degraded": (not gpu_online) or (not tpu_online),
+    }
+
+    if ownership_race:
+        fault_reason = "DMABUF_OWNERSHIP_RACE: double-owner or use-after-handoff detected"
+        reward = -0.95
+        diagnostics.append(
+            {
+                "code": "DMABUF_OWNERSHIP_RACE",
+                "severity": "error",
+                "offset": None,
+                "field": "owner_dev",
+                "message": fault_reason,
+            }
+        )
+    elif require_zero_copy and fallback_copies > 0:
+        fault_reason = f"ZERO_COPY_VIOLATION: {fallback_copies} host fallback copies"
+        reward = -0.80
+        diagnostics.append(
+            {
+                "code": "ZERO_COPY_VIOLATION",
+                "severity": "error",
+                "offset": None,
+                "field": "fallback_copies",
+                "message": fault_reason,
+            }
+        )
+    elif sram_bytes > sram_limit:
+        fault_reason = f"SRAM_OVERFLOW: {sram_bytes} B > {sram_limit} B"
+        reward = -0.75
+        diagnostics.append(
+            {
+                "code": "SRAM_OVERFLOW",
+                "severity": "error",
+                "offset": None,
+                "field": "sram_bytes",
+                "message": fault_reason,
+            }
+        )
+    elif not checks["numerical_parity"]:
+        fault_reason = f"PARITY_FAIL: nmse={nmse} max_abs_err={max_abs_err}"
+        reward = -0.85
+        diagnostics.append(
+            {
+                "code": "PARITY_FAIL",
+                "severity": "error",
+                "offset": None,
+                "field": "nmse",
+                "message": fault_reason,
+            }
+        )
+
+    passed = fault_reason is None
+    breakdown: Dict[str, float]
+    if passed:
+        accuracy_score = max(0.0, min(1.0, 1.0 - nmse * 1e4))
+        sram_eff = max(0.0, min(1.0, 1.0 - (sram_bytes / float(sram_limit)) * 0.5))
+        latency_score = max(0.0, min(1.0, 1.0 / (1.0 + est_hw_us / 500.0)))
+        reward = round(min(1.0, max(0.05, 0.50 + 0.25 * accuracy_score + 0.15 * sram_eff + 0.10 * latency_score)), 6)
+        breakdown = {
+            "gate_pass": 1.0,
+            "accuracy_score": round(accuracy_score, 6),
+            "sram_efficiency": round(sram_eff, 6),
+            "latency_score": round(latency_score, 6),
+        }
+    else:
+        breakdown = {
+            "gate_pass": 0.0,
+            "accuracy_score": 0.0,
+            "sram_efficiency": 0.0,
+            "latency_score": 0.0,
+        }
+
+    eval_ms = round((time.perf_counter() - t0) * 1000.0, 4)
+    return {
+        "schema_version": "freesilicon.twin.v1",
+        "domain": "freesched",
+        "target": target,
+        "workload": workload,
+        "pass": passed,
+        "reward": reward,
+        "nmse": 0.0 if math.isnan(nmse) else nmse,
+        "max_abs_err": 0.0 if math.isnan(max_abs_err) else max_abs_err,
+        "sram_bytes": sram_bytes,
+        "sram_limit_bytes": sram_limit,
+        "est_hw_us": round(est_hw_us, 3),
+        "eval_ms": eval_ms,
+        "fault_reason": fault_reason,
+        "diagnostics": diagnostics,
+        "checks": checks,
+        "reward_breakdown": breakdown,
+    }
+
+
+def _eval_native_freesched_bench(bench_bin: Path, target: str) -> Dict[str, Any]:
+    """Run compiled bench_heterogeneous (FREESCHED_MOCK=1) and convert telemetry into a verdict."""
+    t0 = time.perf_counter()
+    env = dict(os.environ)
+    env["FREESCHED_MOCK"] = "1"
+    proc = subprocess.run(
+        [str(bench_bin)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    text = proc.stdout.decode("utf-8", errors="replace")
+    section_re = re.compile(
+        rf"=== freesched profile: {re.escape(target)}.*?telemetry \(8 iters\): "
+        r"gpu_us=(\d+) tpu_us=(\d+) cpu_us=(\d+) handoff_us=(\d+) "
+        r"zero_copy=(\d+) fallback_copies=(\d+) est_watts=([0-9.]+) W",
+        re.DOTALL,
+    )
+    m = section_re.search(text)
+    if not m:
+        raise RuntimeError(f"Could not parse native bench_heterogeneous output for target={target}")
+    gpu_us, tpu_us, cpu_us, handoff_us, zero_copy, fallback_copies = (int(m.group(i)) for i in range(1, 7))
+    est_watts = float(m.group(7))
+    verdict = _eval_freesched_item(
+        {
+            "domain": "freesched",
+            "target": target,
+            "workload": f"native-bench-{target}",
+            "fallback_copies": fallback_copies,
+        }
+    )
+    verdict["eval_ms"] = round((time.perf_counter() - t0) * 1000.0, 4)
+    verdict["checks"].update(
+        {
+            "native_binary_verified": True,
+            "gpu_us": gpu_us,
+            "tpu_us": tpu_us,
+            "cpu_us": cpu_us,
+            "handoff_us": handoff_us,
+            "zero_copy_handoffs": zero_copy,
+            "fallback_copies": fallback_copies,
+            "est_watts": est_watts,
+        }
+    )
+    return verdict
+
+
+def _eval_freepvr_item(item: Dict[str, Any], freepvr_dir: Path) -> Dict[str, Any]:
+    """Evaluate a freecs or freeusc candidate in-process via FreePVR twin package."""
+    if str(freepvr_dir) not in sys.path:
+        sys.path.insert(0, str(freepvr_dir))
+
+    domain = item["domain"]
+    target = item.get("target", "volcanic-dxt-48-1536")
+    workload = item.get("workload", f"{domain}-candidate")
+
+    if domain == "freecs":
+        from freepvr_twin.freecs import validate_bundle
+        from freepvr_twin.fixtures import build_valid_freecs_bundle
+
+        kind = item.get("kind", "bundle")
+        if "payload" in item:
+            payload = item["payload"]
+        elif item.get("fixture") == "valid_bundle":
+            payload = build_valid_freecs_bundle()
+        elif "input" in item:
+            p = Path(item["input"])
+            payload = json.loads(p.read_text(encoding="utf-8")) if kind == "bundle" else {kind: p.read_bytes()}
+        else:
+            payload = build_valid_freecs_bundle()
+        return validate_bundle(payload, workload=workload, target=target)
+
+    if domain == "freeusc":
+        import struct
+        from freepvr_twin.fixtures import (
+            DEFAULT_SSBO_VA,
+            build_clean_atomic_kernel,
+            build_clean_bda_fma_kernel,
+            build_clean_bitwise_loop_barrier_kernel,
+            build_clean_subgroup_ballot_add_shuffle_kernel,
+            run_mesa_fma32,
+            run_mesa_iadd_sg,
+        )
+        from freepvr_twin.freeusc_isa import bytes_to_words
+        from freepvr_twin.freeusc_sim import (
+            GlobalMemory,
+            SUBGROUP_SIZE,
+            VolcanicUSCState,
+            evaluate_compute_shader,
+        )
+
+        fixture = item.get("fixture")
+        if fixture == "fma32":
+            v = run_mesa_fma32()
+            v["target"] = target
+            return v
+        if fixture == "iadd_sg":
+            v = run_mesa_iadd_sg()
+            v["target"] = target
+            return v
+        if fixture == "clean_bda_fma":
+            fma_w, _ = build_clean_bda_fma_kernel()
+            mem = GlobalMemory()
+            in_va, out_va = DEFAULT_SSBO_VA, DEFAULT_SSBO_VA + 0x1000
+            mem.map_region(in_va, 4096, struct.pack(f"<{SUBGROUP_SIZE}f", *[float(i) for i in range(SUBGROUP_SIZE)]))
+            mem.map_region(out_va, 4096)
+            st = VolcanicUSCState(
+                sh_init={
+                    0: in_va & 0xFFFFFFFF,
+                    1: (in_va >> 32) & 0xFFFFFFFF,
+                    2: out_va & 0xFFFFFFFF,
+                    3: (out_va >> 32) & 0xFFFFFFFF,
+                },
+                memory=mem,
+            )
+            return evaluate_compute_shader(
+                fma_w,
+                workload=item.get("workload", "clean-bda-fma"),
+                target=target,
+                state=st,
+                ssbo_va=out_va,
+                expected_f32=[float(i) * 2.0 + 1.0 for i in range(SUBGROUP_SIZE)],
+            )
+        if fixture == "clean_bitwise_loop":
+            blb_w = build_clean_bitwise_loop_barrier_kernel()
+            mem = GlobalMemory()
+            mem.map_region(DEFAULT_SSBO_VA, 4096)
+            st = VolcanicUSCState(
+                sh_init={0: DEFAULT_SSBO_VA & 0xFFFFFFFF, 1: (DEFAULT_SSBO_VA >> 32) & 0xFFFFFFFF},
+                memory=mem,
+            )
+            return evaluate_compute_shader(
+                blb_w,
+                workload=item.get("workload", "clean-bitwise-loop-barrier"),
+                target=target,
+                state=st,
+                ssbo_va=DEFAULT_SSBO_VA,
+                expected_u32=[((4 * i) ^ 0xFF) >> 1 for i in range(SUBGROUP_SIZE)],
+            )
+        if fixture == "clean_subgroup":
+            sg_w = build_clean_subgroup_ballot_add_shuffle_kernel()
+            mem = GlobalMemory()
+            mem.map_region(DEFAULT_SSBO_VA, 4096)
+            st = VolcanicUSCState(
+                sh_init={0: DEFAULT_SSBO_VA & 0xFFFFFFFF, 1: (DEFAULT_SSBO_VA >> 32) & 0xFFFFFFFF},
+                memory=mem,
+            )
+            exp: List[int] = []
+            for lane in range(SUBGROUP_SIZE):
+                exp.extend([1042, 8128, 127 - lane, 0x55555555])
+            return evaluate_compute_shader(
+                sg_w,
+                workload=item.get("workload", "clean-subgroup-128wide"),
+                target=target,
+                state=st,
+                ssbo_va=DEFAULT_SSBO_VA,
+                expected_u32=exp,
+            )
+        if fixture == "clean_atomic":
+            at_w = build_clean_atomic_kernel()
+            mem = GlobalMemory()
+            mem.map_region(DEFAULT_SSBO_VA, 64)
+            st = VolcanicUSCState(
+                sh_init={0: DEFAULT_SSBO_VA & 0xFFFFFFFF, 1: (DEFAULT_SSBO_VA >> 32) & 0xFFFFFFFF},
+                memory=mem,
+            )
+            return evaluate_compute_shader(
+                at_w,
+                workload=item.get("workload", "clean-bda-atomic-add"),
+                target=target,
+                state=st,
+                ssbo_va=DEFAULT_SSBO_VA,
+                expected_u32=[8128],
+            )
+        if "hex" in item:
+            dwords = [int(tok, 16) for tok in str(item["hex"]).replace(",", " ").split()]
+            return evaluate_compute_shader(
+                dwords,
+                workload=workload,
+                target=target,
+                expected_u32=item.get("expected_u32"),
+                expected_f32=item.get("expected_f32"),
+            )
+        if "bin" in item:
+            dwords = bytes_to_words(Path(item["bin"]).read_bytes())
+            return evaluate_compute_shader(
+                dwords,
+                workload=workload,
+                target=target,
+                expected_u32=item.get("expected_u32"),
+                expected_f32=item.get("expected_f32"),
+            )
+        raise ValueError(f"unsupported freeusc candidate spec: {item!r}")
+
+    raise ValueError(f"unsupported FreePVR domain: {domain}")
+
+
+def _engine_missing_verdict(domain: str, target: str, workload: str, msg: str) -> Dict[str, Any]:
+    safe_domain = domain if domain in VALID_DOMAINS else "freesched"
+    safe_target = target if target in VALID_TARGETS else "laguna"
+    return {
+        "schema_version": "freesilicon.twin.v1",
+        "domain": safe_domain,
+        "target": safe_target,
+        "workload": workload,
+        "pass": False,
+        "reward": -1.0,
+        "nmse": None,
+        "max_abs_err": None,
+        "sram_bytes": None,
+        "sram_limit_bytes": None,
+        "est_hw_us": None,
+        "eval_ms": 0.0,
+        "fault_reason": msg,
+        "diagnostics": [
+            {
+                "code": "ENGINE_UNAVAILABLE",
+                "severity": "error",
+                "offset": None,
+                "field": "domain",
+                "message": msg,
+            }
+        ],
+        "checks": {},
+    }
+
+
+def eval_mixed_batch(
+    items: List[Dict[str, Any]],
+    freepvr_dir: Optional[Path],
+    freetile_bin: Optional[Path],
+    strict_schema: bool = True,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Evaluate a mixed batch of FreeSched, FreePVR, and FreeTile/dgc0 candidates preserving order."""
+    results: List[Optional[Dict[str, Any]]] = [None] * len(items)
+    freetile_indices: List[int] = []
+    freetile_lines: List[str] = []
+
+    for idx, item in enumerate(items):
+        domain = str(item.get("domain", ""))
+        workload = str(item.get("workload", "unknown"))
+        if domain == "freesched":
+            results[idx] = _eval_freesched_item(item)
+        elif domain in ("freecs", "freeusc"):
+            if freepvr_dir is None:
+                results[idx] = _engine_missing_verdict(
+                    domain,
+                    str(item.get("target", "volcanic-dxt-48-1536")),
+                    workload,
+                    "FREEPVR_TWIN_UNAVAILABLE: set FREEPVR_TWIN_DIR or --freepvr-dir",
+                )
+            else:
+                results[idx] = _eval_freepvr_item(item, freepvr_dir)
+        elif domain in ("freetile", "dgc0"):
+            req = dict(item)
+            if domain == "dgc0" and "workload" not in req:
+                req["workload"] = "dgc0"
+            freetile_indices.append(idx)
+            freetile_lines.append(json.dumps(req, separators=(",", ":")))
+        else:
+            results[idx] = _engine_missing_verdict(
+                "freesched",
+                "laguna",
+                workload,
+                f"UNSUPPORTED_DOMAIN: {domain!r}",
+            )
+
+    if freetile_indices:
+        if freetile_bin is None:
+            for idx in freetile_indices:
+                it = items[idx]
+                results[idx] = _engine_missing_verdict(
+                    str(it.get("domain", "freetile")),
+                    str(it.get("target", "buenos-a0")),
+                    str(it.get("workload", "unknown")),
+                    "FREETILE_TWIN_UNAVAILABLE: set FREETILE_TWIN_BIN or --freetile-bin",
+                )
+        else:
+            proc = subprocess.run(
+                [str(freetile_bin), "--batch-jsonl"],
+                input=("\n".join(freetile_lines) + "\n").encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            out_lines = [ln for ln in proc.stdout.decode("utf-8").splitlines() if ln.strip()]
+            if len(out_lines) != len(freetile_indices):
+                raise RuntimeError(
+                    f"freetile-twin --batch-jsonl returned {len(out_lines)} lines for {len(freetile_indices)} requests"
+                )
+            for idx, raw_line in zip(freetile_indices, out_lines):
+                results[idx] = json.loads(raw_line)
+
+    schema_errors = 0
+    final: List[Dict[str, Any]] = []
+    for v in results:
+        assert v is not None
+        if strict_schema:
+            errs = validate_verdict(v)
+            if errs:
+                schema_errors += 1
+                v = dict(v)
+                v["_schema_errors"] = errs
+        final.append(v)
+    return final, schema_errors
+
+
+def cmd_self_test(
+    freepvr_dir: Optional[Path],
+    freetile_bin: Optional[Path],
+    bench_bin: Optional[Path],
+) -> int:
+    t0 = time.perf_counter()
+    schema_doc = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    if schema_doc.get("properties", {}).get("schema_version", {}).get("const") != "freesilicon.twin.v1":
+        print(json.dumps({"self_test": "FAIL", "reason": "REWARD-SCHEMA.json mismatch"}))
+        return 1
+
+    # Always-on Layer 2 freesched verification (passing + intentional hard-gate catches)
+    mixed_items: List[Dict[str, Any]] = [
+        {"domain": "freesched", "target": "laguna", "workload": "prefill-decode-attn", "m_prefill": 512, "m_decode": 1},
+        {"domain": "freesched", "target": "malibu", "workload": "prefill-decode-sme2", "m_prefill": 512, "m_decode": 1},
+        {"domain": "freesched", "target": "laguna", "workload": "degraded-no-gpu", "gpu_online": False},
+        {"domain": "freesched", "target": "laguna", "workload": "intentional-fallback-copy", "fallback_copies": 2},
+        {"domain": "freesched", "target": "malibu", "workload": "intentional-ownership-race", "ownership_race": True},
+    ]
+    expected_fails = 2
+
+    freecs_status = "skipped"
+    freeusc_status = "skipped"
+    mesa_fma32_pass: Optional[bool] = None
+    mesa_iadd_bug_caught: Optional[bool] = None
+
+    if freepvr_dir is not None:
+        freecs_proc = subprocess.run(
+            [sys.executable, str(freepvr_dir / "freecs-validate"), "--self-test"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        freecs_res = json.loads(freecs_proc.stdout.decode("utf-8"))
+        assert freecs_res["self_test"] == "PASS"
+        assert not validate_verdict(freecs_res["sample_valid_verdict"])
+        freecs_status = freecs_res["self_test"]
+
+        freeusc_proc = subprocess.run(
+            [sys.executable, str(freepvr_dir / "freeusc-sim"), "--self-test"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        freeusc_res = json.loads(freeusc_proc.stdout.decode("utf-8"))
+        assert freeusc_res["self_test"] == "PASS"
+        freeusc_status = freeusc_res["self_test"]
+
+        mesa_proc = subprocess.run(
+            [sys.executable, str(freepvr_dir / "freeusc-sim"), "--mesa-proof"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        mesa_res = json.loads(mesa_proc.stdout.decode("utf-8"))["mesa_stage_g3b_proof"]
+        assert mesa_res["fma32"]["pass"] is True
+        assert mesa_res["iadd_sg"]["pass"] is False
+        assert not validate_verdict(mesa_res["fma32"])
+        assert not validate_verdict(mesa_res["iadd_sg"])
+        mesa_fma32_pass = bool(mesa_res["fma32"]["pass"])
+        mesa_iadd_bug_caught = not bool(mesa_res["iadd_sg"]["pass"])
+
+        mixed_items.extend(
+            [
+                {"domain": "freecs", "fixture": "valid_bundle", "workload": "smoke-freecs-bundle", "target": "volcanic-dxt-48-1536"},
+                {"domain": "freeusc", "fixture": "fma32", "target": "volcanic-dxt-48-1536"},
+                {"domain": "freeusc", "fixture": "iadd_sg", "target": "volcanic-dxt-48-1536"},
+                {"domain": "freeusc", "fixture": "clean_subgroup", "target": "volcanic-cxtp-48-1536"},
+            ]
+        )
+        expected_fails += 1
+
+    if freetile_bin is not None:
+        mixed_items.extend(
+            [
+                {"domain": "freetile", "target": "buenos-a0", "workload": "gemm", "m": 16, "k": 64, "n": 64},
+                {"domain": "freetile", "target": "buenos-a0", "workload": "swiglu", "swiglu_11chunk": True, "m": 1, "k": 576, "h": 512, "n": 576},
+                {"domain": "freetile", "target": "buenos-a0", "workload": "q4_k", "m": 8, "k": 256, "n": 64},
+                {"domain": "freetile", "target": "malibu", "workload": "flash_attn", "fa_phase": "prefill", "head_dim": 128, "seq_len": 256},
+                {"domain": "freetile", "target": "malibu", "workload": "iq4_xs", "m": 4, "k": 256, "n": 64},
+                {"domain": "freetile", "target": "buenos-a0", "workload": "flash_attn", "fa_phase": "prefill", "head_dim": 128, "br": 64, "bc": 1024},
+            ]
+        )
+        expected_fails += 1
+
+    verdicts, schema_errs = eval_mixed_batch(
+        mixed_items,
+        freepvr_dir=freepvr_dir,
+        freetile_bin=freetile_bin,
+        strict_schema=True,
+    )
+    assert schema_errs == 0, f"schema validation failed on {schema_errs} verdicts"
+
+    native_verdicts: List[Dict[str, Any]] = []
+    if bench_bin is not None:
+        for tgt in ("laguna", "malibu"):
+            nv = _eval_native_freesched_bench(bench_bin, tgt)
+            assert not validate_verdict(nv), f"native verdict schema error for {tgt}"
+            assert nv["pass"] is True
+            native_verdicts.append(nv)
+
+    pass_count = sum(1 for v in verdicts if v["pass"])
+    fail_count = sum(1 for v in verdicts if not v["pass"])
+    assert fail_count == expected_fails, f"expected {expected_fails} intentional fails, got {fail_count}"
+
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    summary = {
+        "self_test": "PASS",
+        "schema_version": "freesilicon.twin.v1",
+        "schema_errors": schema_errs,
+        "engines_available": {
+            "freesched": True,
+            "freesched_native_bench": bench_bin is not None,
+            "freepvr_twin": freepvr_dir is not None,
+            "freetile_twin": freetile_bin is not None,
+        },
+        "freecs_self_test": freecs_status,
+        "freeusc_self_test": freeusc_status,
+        "mesa_fma32_pass": mesa_fma32_pass,
+        "mesa_iadd_sg_bug_caught": mesa_iadd_bug_caught,
+        "mixed_batch_total": len(verdicts),
+        "mixed_batch_passed": pass_count,
+        "mixed_batch_intentional_fails": fail_count,
+        "native_bench_verified": len(native_verdicts),
+        "total_ms": round(total_ms, 3),
+        "verdict_rewards": [
+            {
+                "domain": v["domain"],
+                "target": v["target"],
+                "workload": v["workload"],
+                "pass": v["pass"],
+                "reward": v["reward"],
+            }
+            for v in verdicts
+        ],
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def cmd_bench(
+    freepvr_dir: Optional[Path],
+    freetile_bin: Optional[Path],
+    n_freesched: int,
+    n_freecs: int,
+    n_freeusc: int,
+    n_freetile: int,
+) -> int:
+    # Always benchmark freesched schedule evaluator
+    t0 = time.perf_counter()
+    sample_laguna = {"domain": "freesched", "target": "laguna", "workload": "bench-laguna", "m_prefill": 512, "m_decode": 1}
+    sample_malibu = {"domain": "freesched", "target": "malibu", "workload": "bench-malibu", "m_prefill": 512, "m_decode": 1}
+    for i in range(n_freesched):
+        _eval_freesched_item(sample_laguna if (i & 1) == 0 else sample_malibu)
+    elapsed_s = max(time.perf_counter() - t0, 1e-9)
+    freesched_b = {
+        "evals": n_freesched,
+        "elapsed_ms": round(elapsed_s * 1000.0, 3),
+        "ms_per_eval": round((elapsed_s * 1000.0) / n_freesched, 5),
+        "evals_per_min": round((n_freesched / elapsed_s) * 60.0, 1),
+    }
+
+    engines: Dict[str, Any] = {"freesched-twin": freesched_b}
+    gates: Dict[str, bool] = {
+        "freesched_ge_1000_per_min": freesched_b["evals_per_min"] >= 1000.0 and freesched_b["ms_per_eval"] < 5.0
+    }
+
+    if freepvr_dir is not None:
+        freecs_p = subprocess.run(
+            [sys.executable, str(freepvr_dir / "freecs-validate"), "--bench", str(n_freecs)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        freecs_b = json.loads(freecs_p.stdout.decode("utf-8"))
+        engines["freecs-validate"] = freecs_b
+        gates["freecs_ge_1000_per_min"] = freecs_b["evals_per_min"] >= 1000.0 and freecs_b["ms_per_eval"] < 5.0
+
+        freeusc_p = subprocess.run(
+            [sys.executable, str(freepvr_dir / "freeusc-sim"), "--bench", str(n_freeusc)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        freeusc_b = json.loads(freeusc_p.stdout.decode("utf-8"))
+        engines["freeusc-sim"] = freeusc_b
+        gates["freeusc_ge_1000_per_min"] = freeusc_b["evals_per_min"] >= 1000.0
+
+    if freetile_bin is not None:
+        ft_p = subprocess.run(
+            [str(freetile_bin), "--bench", str(n_freetile)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        freetile_b = json.loads(ft_p.stdout.decode("utf-8"))
+        engines["freetile-twin"] = freetile_b
+        gates["freetile_ge_1000_per_min"] = freetile_b["evals_per_min"] >= 1000.0
+
+    out = {
+        "schema_version": "freesilicon.twin.v1",
+        "all_gates_pass": all(gates.values()),
+        "gates": gates,
+        "engines": engines,
+    }
+    print(json.dumps(out, indent=2))
+    return 0 if out["all_gates_pass"] else 1
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args_list = list(sys.argv[1:] if argv is None else argv)
+
+    explicit_pvr: Optional[str] = None
+    explicit_ft: Optional[str] = None
+    explicit_fs: Optional[str] = None
+    filtered: List[str] = []
+    i = 0
+    while i < len(args_list):
+        tok = args_list[i]
+        if tok == "--freepvr-dir" and i + 1 < len(args_list):
+            explicit_pvr = args_list[i + 1]
+            i += 2
+        elif tok.startswith("--freepvr-dir="):
+            explicit_pvr = tok.split("=", 1)[1]
+            i += 1
+        elif tok == "--freetile-bin" and i + 1 < len(args_list):
+            explicit_ft = args_list[i + 1]
+            i += 2
+        elif tok.startswith("--freetile-bin="):
+            explicit_ft = tok.split("=", 1)[1]
+            i += 1
+        elif tok == "--freesched-bin" and i + 1 < len(args_list):
+            explicit_fs = args_list[i + 1]
+            i += 2
+        elif tok.startswith("--freesched-bin="):
+            explicit_fs = tok.split("=", 1)[1]
+            i += 1
+        else:
+            filtered.append(tok)
+            i += 1
+
+    if not filtered or filtered[0] in ("-h", "--help"):
+        print(
+            "freesilicon-twin — FreeSilicon Computer 2 Digital Twin CLI (freesilicon.twin.v1)\n\n"
+            "Usage:\n"
+            "  freesilicon-twin [--freepvr-dir DIR] [--freetile-bin PATH] [--freesched-bin PATH] <command> [args...]\n\n"
+            "Commands:\n"
+            "  sched [--target laguna|malibu] [--native]  Evaluate Layer 2 freesched schedule\n"
+            "  freecs [args...]                           Run FreePVR command-stream/FW-ABI validator\n"
+            "  freeusc [args...]                          Run FreePVR 128-lane Volcanic USC simulator\n"
+            "  freetile [args...]                         Run FreeTPU / FreeTile twin simulator\n"
+            "  dgc0 <file.dgc0> [args...]                 Validate a raw .dgc0 wire payload via freetile-twin\n"
+            "  eval [--spec FILE | --jsonl] [--pretty]    Evaluate mixed GPU+TPU+Scheduler candidates\n"
+            "  validate-verdict <FILE | ->                Validate JSON/JSONL verdict(s) against REWARD-SCHEMA.json\n"
+            "  self-test                                  Run offline verification across all available engines\n"
+            "  bench [--freesched N] [--freecs N] [--freeusc N] [--freetile N]\n"
+            "                                             Run combined throughput benchmark (>= 1,000 evals/min)\n"
+        )
+        return 0
+
+    cmd = filtered[0]
+    rest = filtered[1:]
+    freepvr_dir = find_freepvr_dir(explicit_pvr)
+    freetile_bin = find_freetile_bin(explicit_ft)
+    bench_bin = find_freesched_bench_bin(explicit_fs)
+
+    if cmd == "sched":
+        p = argparse.ArgumentParser(prog="freesilicon-twin sched")
+        p.add_argument("--target", default="laguna", choices=["laguna", "malibu", "host-mock"])
+        p.add_argument("--workload", default="prefill-decode-attn")
+        p.add_argument("--m-prefill", type=int, default=512)
+        p.add_argument("--m-decode", type=int, default=1)
+        p.add_argument("--native", action="store_true", help="Run compiled bench_heterogeneous binary")
+        p.add_argument("--pretty", action="store_true")
+        ns = p.parse_args(rest)
+        if ns.native:
+            if bench_bin is None:
+                print(json.dumps({"error": "bench_heterogeneous not built; run `make all` or set --freesched-bin"}), file=sys.stderr)
+                return 2
+            verdict = _eval_native_freesched_bench(bench_bin, ns.target)
+        else:
+            verdict = _eval_freesched_item(
+                {
+                    "domain": "freesched",
+                    "target": ns.target,
+                    "workload": ns.workload,
+                    "m_prefill": ns.m_prefill,
+                    "m_decode": ns.m_decode,
+                }
+            )
+        print(json.dumps(verdict, indent=2 if ns.pretty else None))
+        return 0 if verdict["pass"] else 1
+
+    if cmd == "freecs":
+        if freepvr_dir is None:
+            print(json.dumps({"error": "FreePVR twin not found; set FREEPVR_TWIN_DIR or --freepvr-dir"}), file=sys.stderr)
+            return 2
+        return _run_passthrough([sys.executable, str(freepvr_dir / "freecs-validate"), *rest])
+
+    if cmd == "freeusc":
+        if freepvr_dir is None:
+            print(json.dumps({"error": "FreePVR twin not found; set FREEPVR_TWIN_DIR or --freepvr-dir"}), file=sys.stderr)
+            return 2
+        return _run_passthrough([sys.executable, str(freepvr_dir / "freeusc-sim"), *rest])
+
+    if cmd == "freetile":
+        if freetile_bin is None:
+            print(json.dumps({"error": "freetile-twin binary not found; set FREETILE_TWIN_BIN or --freetile-bin"}), file=sys.stderr)
+            return 2
+        return _run_passthrough([str(freetile_bin), *rest])
+
+    if cmd == "dgc0":
+        if freetile_bin is None:
+            print(json.dumps({"error": "freetile-twin binary not found; set FREETILE_TWIN_BIN or --freetile-bin"}), file=sys.stderr)
+            return 2
+        if not rest:
+            print("Usage: freesilicon-twin dgc0 <payload.dgc0> [--target buenos-a0|malibu]", file=sys.stderr)
+            return 2
+        return _run_passthrough([str(freetile_bin), "--dgc0", rest[0], *rest[1:]])
+
+    if cmd == "eval":
+        p = argparse.ArgumentParser(prog="freesilicon-twin eval")
+        p.add_argument("--spec", help="JSON file containing one candidate object or a list of candidates")
+        p.add_argument("--jsonl", action="store_true", help="Read candidate JSONL from stdin and emit JSONL")
+        p.add_argument("--pretty", action="store_true", help="Pretty-print single/list JSON output")
+        ns = p.parse_args(rest)
+        if ns.jsonl:
+            items = [json.loads(ln) for ln in sys.stdin if ln.strip()]
+            verdicts, errs = eval_mixed_batch(
+                items, freepvr_dir=freepvr_dir, freetile_bin=freetile_bin, strict_schema=True
+            )
+            for v in verdicts:
+                print(json.dumps(v, separators=(",", ":")))
+            return 0 if errs == 0 else 1
+        if ns.spec:
+            raw = json.loads(Path(ns.spec).read_text(encoding="utf-8"))
+            is_list = isinstance(raw, list)
+            items = raw if is_list else [raw]
+            verdicts, errs = eval_mixed_batch(
+                items, freepvr_dir=freepvr_dir, freetile_bin=freetile_bin, strict_schema=True
+            )
+            out_obj: Any = verdicts if is_list else verdicts[0]
+            print(json.dumps(out_obj, indent=2 if ns.pretty else None))
+            return 0 if errs == 0 else 1
+        p.print_help()
+        return 2
+
+    if cmd == "validate-verdict":
+        if not rest:
+            print("Usage: freesilicon-twin validate-verdict <file.json | ->", file=sys.stderr)
+            return 2
+        src = (sys.stdin.read() if rest[0] == "-" else Path(rest[0]).read_text(encoding="utf-8")).strip()
+        records: List[Any] = []
+        if src.startswith("["):
+            records = json.loads(src)
+        else:
+            try:
+                records = [json.loads(src)]
+            except json.JSONDecodeError:
+                records = [json.loads(ln) for ln in src.splitlines() if ln.strip()]
+        bad = []
+        for idx, rec in enumerate(records):
+            errs = validate_verdict(rec)
+            if errs:
+                bad.append({"index": idx, "errors": errs})
+        print(json.dumps({"valid": len(bad) == 0, "checked": len(records), "failures": bad}, indent=2))
+        return 0 if not bad else 1
+
+    if cmd == "self-test":
+        return cmd_self_test(freepvr_dir=freepvr_dir, freetile_bin=freetile_bin, bench_bin=bench_bin)
+
+    if cmd == "bench":
+        p = argparse.ArgumentParser(prog="freesilicon-twin bench")
+        p.add_argument("--freesched", type=int, default=5000)
+        p.add_argument("--freecs", type=int, default=5000)
+        p.add_argument("--freeusc", type=int, default=500)
+        p.add_argument("--freetile", type=int, default=1200)
+        ns = p.parse_args(rest)
+        return cmd_bench(
+            freepvr_dir=freepvr_dir,
+            freetile_bin=freetile_bin,
+            n_freesched=ns.freesched,
+            n_freecs=ns.freecs,
+            n_freeusc=ns.freeusc,
+            n_freetile=ns.freetile,
+        )
+
+    print(f"Unknown subcommand: {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -29,7 +29,7 @@ TEST_C11   := $(BUILD_DIR)/test_c11_abi
 TEST_CXX   := $(BUILD_DIR)/test_freesched
 BENCH_BIN  := $(BUILD_DIR)/bench_heterogeneous
 
-.PHONY: all lib test bench verify-headers audit verify clean
+.PHONY: all lib test twin-test bench verify-headers audit verify clean
 
 all: lib $(TEST_C11) $(TEST_CXX) $(BENCH_BIN)
 
@@ -62,12 +62,16 @@ verify-headers: $(THIS_DIR)/include/freesched.h $(THIS_DIR)/include/ggml_freesil
 	$(HOST_CC) -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror -I$(THIS_DIR)/include $(THIS_DIR)/include/ggml_freesilicon.h
 	$(HOST_CXX) -x c++ -std=c++17 -fsyntax-only -Wall -Wextra -Werror -I$(THIS_DIR)/include $(THIS_DIR)/include/ggml_freesilicon.h
 
-test: $(TEST_C11) $(TEST_CXX)
+test: $(TEST_C11) $(TEST_CXX) $(BENCH_BIN) twin-test
 	FREESCHED_MOCK=1 $(TEST_C11)
 	FREESCHED_MOCK=1 $(TEST_CXX)
 
+twin-test: $(BENCH_BIN)
+	python3 -m unittest discover -s $(THIS_DIR)/tests -p 'test_*.py' -v
+
 bench: $(BENCH_BIN)
 	FREESCHED_MOCK=1 $(BENCH_BIN)
+	$(THIS_DIR)/twin/freesilicon-twin bench --freesched 2000
 
 audit:
 	$(THIS_DIR)/scripts/clean-room-audit.sh
