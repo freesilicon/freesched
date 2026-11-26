@@ -379,7 +379,11 @@ fs_status_t fs_buffer_alloc_reconciled(fs_context_t*        ctx,
     return st;
   }
 
-  const size_t   aligned_bytes = fs_align_up(size_bytes, rec.min_align > 0u ? rec.min_align : 1u);
+  const size_t align = rec.min_align > 0u ? rec.min_align : 1u;
+  const size_t aligned_bytes = fs_align_up(size_bytes, align);
+  if (aligned_bytes < size_bytes) {
+    return FS_ERR_OVERFLOW;
+  }
   const uint32_t eff_flags =
       zc_ok ? flags : (flags | static_cast<uint32_t>(FS_BUF_FORCE_HOST_COPY));
   fs_dmabuf_t* buf = nullptr;
@@ -388,9 +392,23 @@ fs_status_t fs_buffer_alloc_reconciled(fs_context_t*        ctx,
     return st;
   }
 
+  const uint32_t first_lmask = fs_effective_layout_mask(&attrs[0]);
+  const fs_buf_layout_t fallback_layout =
+      ((first_lmask & FS_LAYOUT_BIT(FS_LAYOUT_LINEAR)) != 0u)
+          ? FS_LAYOUT_LINEAR
+          : (((first_lmask & FS_LAYOUT_BIT(FS_LAYOUT_TILED)) != 0u) ? FS_LAYOUT_TILED
+                                                                    : FS_LAYOUT_ANY);
+  const uint32_t first_cmask = fs_effective_coherency_mask(&attrs[0]);
+  const fs_buf_coherency_t fallback_coh =
+      ((first_cmask & FS_COHERENCY_BIT(FS_COHERENCY_NON_COHERENT)) != 0u)
+          ? FS_COHERENCY_NON_COHERENT
+          : (((first_cmask & FS_COHERENCY_BIT(FS_COHERENCY_COHERENT)) != 0u)
+                 ? FS_COHERENCY_COHERENT
+                 : FS_COHERENCY_ANY);
+
   buf->size                 = size_bytes;
-  buf->layout               = zc_ok ? rec.layout : attrs[0].layout;
-  buf->coherency            = zc_ok ? rec.coherency : attrs[0].coherency;
+  buf->layout               = zc_ok ? rec.layout : fallback_layout;
+  buf->coherency            = zc_ok ? rec.coherency : fallback_coh;
   buf->min_align            = rec.min_align;
   buf->stride_align         = rec.stride_align;
   buf->zero_copy_compatible = zc_ok;

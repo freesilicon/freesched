@@ -48,10 +48,18 @@ int fs_dev_is_cpu(fs_dev_t dev) {
 }
 
 size_t fs_align_up(size_t value, size_t alignment) {
-  if (alignment == 0u) {
+  if (alignment <= 1u) {
     return value;
   }
-  return (value + alignment - 1u) & ~(alignment - 1u);
+  const size_t rem = value % alignment;
+  if (rem == 0u) {
+    return value;
+  }
+  const size_t pad = alignment - rem;
+  if (value > static_cast<size_t>(-1) - pad) {
+    return 0u; /* Signals overflow to callers */
+  }
+  return value + pad;
 }
 
 static void fs_copy_str(char* dst, size_t dst_size, const char* src) {
