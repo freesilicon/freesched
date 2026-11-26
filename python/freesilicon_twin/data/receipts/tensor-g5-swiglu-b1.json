@@ -1,0 +1,107 @@
+{
+  "receipt_version": "freesilicon.sol-receipt.v1",
+  "schema_version": "freesilicon.twin.v1",
+  "title": "Tensor G5 (BUENOS_A0) Batch-1 SwiGLU Speed-of-Light Calibration Receipt",
+  "target": "laguna",
+  "accelerator": "BUENOS_A0 EdgeTPU",
+  "hardware_envelope": {
+    "peak_tops_int8": 12.0,
+    "peak_mem_bw_gbps": 48.0,
+    "sram_limit_bytes": 2097152,
+    "vii_launch_overhead_us": 18.0,
+    "eff_bw_ratio": 0.56
+  },
+  "workload_spec": {
+    "name": "smollm2_swiglu_b1",
+    "op": "SWIGLU",
+    "dtype": "INT8_EXT2_Q8_0",
+    "m": 1,
+    "k": 576,
+    "h": 1536,
+    "n": 576
+  },
+  "sol_reference": {
+    "flops": 5314560,
+    "bytes_moved": 2669952,
+    "arithmetic_intensity_ops_per_byte": 1.9905,
+    "compute_sol_us": 0.443,
+    "memory_sol_us": 55.624,
+    "sol_floor_us": 55.624,
+    "bottleneck": "memory_bandwidth"
+  },
+  "schedule_a_baseline": {
+    "description": "Unfused 3-VII SwiGLU (gate + up + down separate launches with intermediate DRAM round-trips)",
+    "candidate": {
+      "domain": "freesched",
+      "target": "laguna",
+      "workload": "swiglu-b1-unfused",
+      "m_decode": 1,
+      "k": 576,
+      "h": 1536,
+      "n": 576,
+      "chained_in_sram": false,
+      "num_chunks": 1,
+      "measured_hw_us": 176.0
+    },
+    "expected": {
+      "pass": true,
+      "max_twin_error_pct": 0.05
+    }
+  },
+  "schedule_b_chained": {
+    "description": "1-change schedule: chained_in_sram=true (single-VII in-SRAM 0x640 Horner SiLU fusion, 0 intermediate DRAM traffic)",
+    "candidate": {
+      "domain": "freesched",
+      "target": "laguna",
+      "workload": "swiglu-b1-chained",
+      "m_decode": 1,
+      "k": 576,
+      "h": 1536,
+      "n": 576,
+      "chained_in_sram": true,
+      "num_chunks": 1,
+      "measured_hw_us": 114.0
+    },
+    "silicon_measurement": {
+      "warm_hw_us": 114.0,
+      "int8_exact_warm_hw_us": 121.0,
+      "q8_0_nmse": 0.00239,
+      "int8_max_abs_err": 0,
+      "chunks": 1,
+      "vii_launches": 1
+    },
+    "expected": {
+      "pass": true,
+      "min_pct_sol": 0.45,
+      "max_twin_error_pct": 0.05
+    }
+  },
+  "ab_comparison": {
+    "single_change": "chained_in_sram: false -> true (3 VII launches + DRAM intermediate -> 1 in-SRAM VII launch)",
+    "measured_speedup": 1.544,
+    "dram_bytes_saved": 9216,
+    "vii_launches_saved": 2
+  },
+  "cross_shape_validation": [
+    {
+      "name": "qwen25_q4_1x1536x8960",
+      "candidate": {
+        "domain": "freesched",
+        "target": "laguna",
+        "workload": "swiglu-b1-qwen25",
+        "m_decode": 1,
+        "k": 1536,
+        "h": 8960,
+        "n": 1536,
+        "chained_in_sram": true,
+        "num_chunks": 9,
+        "measured_hw_us": 1688.0
+      },
+      "expected": {
+        "pass": true,
+        "min_pct_sol": 0.48,
+        "max_twin_error_pct": 0.05
+      }
+    }
+  ]
+}

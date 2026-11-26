@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://freesilicon.dev/schemas/freesilicon-twin-reward-v1.json",
+  "title": "FreeSilicon Computer 2 Digital Twin Verdict & GRPO Reward Schema",
+  "description": "Deterministic verdict, physical/numerical diagnostics, and scalar RL reward contract emitted by freesilicon-twin across FreePVR (freecs-validate, freeusc-sim), FreeTPU/FreeTile (freetile-twin), and FreeSched (cross-accelerator DMA-BUF scheduler).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "domain",
+    "target",
+    "workload",
+    "pass",
+    "reward",
+    "fault_reason",
+    "eval_ms",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "freesilicon.twin.v1"
+    },
+    "domain": {
+      "type": "string",
+      "enum": ["freecs", "freeusc", "freetile", "dgc0", "freesched"]
+    },
+    "target": {
+      "type": "string",
+      "enum": [
+        "volcanic-dxt-48-1536",
+        "volcanic-cxtp-48-1536",
+        "buenos-a0",
+        "malibu",
+        "laguna",
+        "host-mock"
+      ]
+    },
+    "workload": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pass": {
+      "type": "boolean"
+    },
+    "reward": {
+      "type": "number",
+      "minimum": -1.0,
+      "maximum": 1.0,
+      "description": "Deterministic scalar RL reward for GRPO/evolutionary loops. Failed hard gates (ABI/SRAM/decode/ownership/fallback-copy/timeout/NaN) produce negative reward in [-1.0, -0.1]; passing kernels/schedules score in (0.0, 1.0] combining accuracy, SRAM/zero-copy efficiency, and estimated hardware latency."
+    },
+    "nmse": {
+      "type": ["number", "null"],
+      "minimum": 0.0
+    },
+    "max_abs_err": {
+      "type": ["number", "null"],
+      "minimum": 0.0
+    },
+    "sram_bytes": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "sram_limit_bytes": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "est_hw_us": {
+      "type": ["number", "null"],
+      "minimum": 0.0
+    },
+    "bytes_moved": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total modeled DRAM/SRAM traffic in bytes for roofline SOL calculation."
+    },
+    "flops": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total arithmetic operations (FLOPs / INT8 OPs) for roofline SOL calculation."
+    },
+    "sol_floor_us": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "description": "Theoretical Speed-of-Light roofline floor in microseconds: max(bytes_moved / peak_bw, flops / peak_ops)."
+    },
+    "twin_pred_us": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "description": "Digital Twin predicted hardware execution time in microseconds."
+    },
+    "measured_hw_us": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "description": "Optional real silicon measured execution time in microseconds when hardware proof exists."
+    },
+    "pct_sol": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Speed-of-Light attainment ratio: sol_floor_us / effective_us (in [0.0, 1.0])."
+    },
+    "twin_error_pct": {
+      "type": ["number", "null"],
+      "minimum": 0.0,
+      "description": "Relative twin prediction error against real silicon: abs(twin_pred_us - measured_hw_us) / measured_hw_us."
+    },
+    "eval_ms": {
+      "type": "number",
+      "minimum": 0.0
+    },
+    "fault_reason": {
+      "type": ["string", "null"],
+      "description": "Null on pass; concise machine-readable fault code and reason on failure."
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "severity", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "severity": { "type": "string", "enum": ["error", "warning", "info"] },
+          "offset": { "type": ["integer", "string", "null"] },
+          "field": { "type": ["string", "null"] },
+          "message": { "type": "string" }
+        }
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "reward_breakdown": {
+      "type": "object",
+      "properties": {
+        "gate_pass": { "type": "number" },
+        "accuracy_score": { "type": "number" },
+        "sram_efficiency": { "type": "number" },
+        "latency_score": { "type": "number" }
+      }
+    }
+  }
+}

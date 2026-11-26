@@ -43,6 +43,41 @@ jobs:
           make verify
           ./twin/freesilicon-twin self-test
 
+  python-sdk:
+    name: Python SDK, Wheel Build & Isolated Venv Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install editable SDK + build/pytest in isolated venv and run tests
+        run: |
+          python -m venv .venv-ci
+          .venv-ci/bin/python -m pip install --upgrade pip
+          .venv-ci/bin/python -m pip install -e ".[dev]"
+          .venv-ci/bin/pytest -v
+          .venv-ci/bin/python examples/trl_grpo_reward.py
+          .venv-ci/bin/python examples/nemo_rl_reward.py
+
+      - name: Build wheel/sdist and verify clean isolated wheel install
+        run: |
+          .venv-ci/bin/python -m build --outdir dist
+          python -m venv .venv-wheel
+          .venv-wheel/bin/python -m pip install --upgrade pip
+          .venv-wheel/bin/python -m pip install dist/*.whl
+          cd /tmp
+          "${{ github.workspace }}/.venv-wheel/bin/freesilicon-twin" self-test
+          "${{ github.workspace }}/.venv-wheel/bin/freesilicon-twin" verify-receipt
+          "${{ github.workspace }}/.venv-wheel/bin/python" -c "from freesilicon_twin import score_kernel, score_completion, list_targets, load_profile; r = score_kernel({'op':'SWIGLU','m':1,'k':576,'h':1536,'n':576,'chained_in_sram':True}, target='tensor_g5'); assert r.valid and r.reward > 0.0; assert score_completion(['bad'])[0] < 0.0; print('wheel_ok', r.latency_us, r.sol_pct)"
+
   clean-room-audit:
     name: Clean-Room & OSS Boundary Audit
     runs-on: ubuntu-latest

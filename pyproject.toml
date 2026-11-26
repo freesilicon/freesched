@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freesilicon-twin"
+version = "0.1.0"
+description = "Clean-room FreeSilicon Digital Twin SDK, SOLAR roofline scorer, and 3-line GRPO RL reward hook"
+readme = "twin/README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+  {name = "FreeSilicon Contributors"},
+]
+keywords = [
+  "edgetpu",
+  "vulkan",
+  "roofline",
+  "digital-twin",
+  "grpo",
+  "reinforcement-learning",
+  "trl",
+  "nemo-rl",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.0",
+  "pytest>=7.4",
+]
+rl = [
+  "trl>=0.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/freesilicon/freesched"
+Repository = "https://github.com/freesilicon/freesched"
+Issues = "https://github.com/freesilicon/freesched/issues"
+
+[project.scripts]
+freesilicon-twin = "freesilicon_twin.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["freesilicon_twin*"]
+
+[tool.setuptools.package-data]
+freesilicon_twin = [
+  "data/*.json",
+  "data/profiles/*.json",
+  "data/receipts/*.json",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

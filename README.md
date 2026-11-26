@@ -77,11 +77,24 @@ FREESCHED_MOCK=1 ./build-cmake/bench_heterogeneous
 4. Heterogeneous laptop benchmark (`bench_heterogeneous`) + `twin/freesilicon-twin` Digital Twin suite & `>= 1,000 evals/min` throughput gate.
 5. Clean-room boundary audit (`./scripts/clean-room-audit.sh`).
 
-## Computer 2 Digital Twin (`twin/`)
+## Computer 2 Digital Twin & Python SDK (`freesilicon-twin`)
 
-`freesched` ships with the unified Computer 2 Digital Twin CLI ([twin/freesilicon-twin](twin/freesilicon-twin)) and `freesilicon.twin.v1` GRPO/RL reward contract ([twin/REWARD-SCHEMA.json](twin/REWARD-SCHEMA.json)):
+`freesched` ships a pure-Python stdlib SDK (`pyproject.toml`, zero heavy runtime dependencies) alongside the unified Computer 2 Digital Twin CLI ([twin/freesilicon-twin](twin/freesilicon-twin)) and `freesilicon.twin.v1` GRPO/RL reward contract ([twin/REWARD-SCHEMA.json](twin/REWARD-SCHEMA.json)):
+
+```python
+from freesilicon_twin import score_kernel, score_completion
+
+# Direct kernel scoring against the calibrated Tensor G5 SOLAR profile (<1% silicon error)
+res = score_kernel({"op": "SWIGLU", "m": 1, "k": 576, "h": 1536, "n": 576, "chained_in_sram": True}, target="tensor_g5")
+
+# 3-line GRPO / TRL / NeMo-RL reward hook (completions -> list[float] in [-1.0, 1.0])
+rewards = score_completion(completions, target="tensor_g5")
+```
 
 ```bash
+# Install the pure-Python SDK (editable or wheel)
+pip install -e .
+
 # Run offline verification across built-in FreeSched + any sibling FreePVR / FreeTile twins
 ./twin/freesilicon-twin self-test
 
@@ -92,7 +105,7 @@ cat <<'EOF' | ./twin/freesilicon-twin eval --jsonl | ./twin/freesilicon-twin val
 EOF
 ```
 
-See [twin/README.md](twin/README.md) for `FREEPVR_TWIN_DIR` and `FREETILE_TWIN_BIN` plugin discovery.
+See [twin/README.md](twin/README.md), [examples/trl_grpo_reward.py](examples/trl_grpo_reward.py), and [examples/nemo_rl_reward.py](examples/nemo_rl_reward.py) for GRPO integration and `FREEPVR_TWIN_DIR` / `FREETILE_TWIN_BIN` plugin discovery.
 
 ## License
 

@@ -29,6 +29,27 @@ EOF
 ./twin/freesilicon-twin verify-receipt twin/receipts/tensor-g5-swiglu-b1.json
 ```
 
+## Python SDK & 3-Line GRPO Reward Hook
+
+```sh
+pip install -e .
+```
+
+```python
+from freesilicon_twin import score_kernel, score_completion, list_targets, load_profile
+
+res = score_kernel(
+    {"op": "SWIGLU", "m": 1, "k": 576, "h": 1536, "n": 576, "chained_in_sram": True},
+    target="tensor_g5",
+)
+# res.latency_us, res.sol_pct, res.valid, res.reward, res.diagnostics
+
+# Drop-in TRL GRPOTrainer / NeMo-RL reward hook (bounded in [-1.0, 1.0]):
+rewards = score_completion(completions, target="tensor_g5")
+```
+
+See [examples/trl_grpo_reward.py](../examples/trl_grpo_reward.py) and [examples/nemo_rl_reward.py](../examples/nemo_rl_reward.py).
+
 ## Plugging In Sibling Hardware Twins
 
 Dependencies stay strictly one-way — point the CLI at local `freepvr` / `freetpu` twin builds via env vars or flags:
