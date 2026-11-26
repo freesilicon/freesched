@@ -1,0 +1,50 @@
+name: freesched CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build, Strict C11/C++17 Headers & Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build
+
+      - name: Verify strict C11 & C++17 public headers
+        run: |
+          make verify-headers
+
+      - name: Build & test with CMake + Ninja
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S . -B build-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-cmake -j"$(nproc)"
+          FREESCHED_MOCK=1 ctest --test-dir build-cmake --output-on-failure
+          FREESCHED_MOCK=1 ./build-cmake/bench_heterogeneous
+
+      - name: Build, test & benchmark with Make
+        run: |
+          make clean
+          make verify
+
+  clean-room-audit:
+    name: Clean-Room & OSS Boundary Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run clean-room audit
+        run: ./scripts/clean-room-audit.sh
