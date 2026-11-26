@@ -138,14 +138,19 @@ def validate_verdict(verdict: Any) -> List[str]:
         errors.append("pass must be boolean")
 
     reward = verdict.get("reward")
-    if not isinstance(reward, (int, float)) or isinstance(reward, bool):
-        errors.append("reward must be a number")
+    if not isinstance(reward, (int, float)) or isinstance(reward, bool) or not math.isfinite(float(reward)):
+        errors.append("reward must be a finite number")
     elif not (-1.0 <= float(reward) <= 1.0):
         errors.append(f"reward out of [-1.0, 1.0]: {reward}")
 
     eval_ms = verdict.get("eval_ms")
-    if not isinstance(eval_ms, (int, float)) or isinstance(eval_ms, bool) or float(eval_ms) < 0.0:
-        errors.append(f"eval_ms must be a non-negative number: {eval_ms!r}")
+    if (
+        not isinstance(eval_ms, (int, float))
+        or isinstance(eval_ms, bool)
+        or not math.isfinite(float(eval_ms))
+        or float(eval_ms) < 0.0
+    ):
+        errors.append(f"eval_ms must be a non-negative finite number: {eval_ms!r}")
 
     fr = verdict.get("fault_reason")
     if fr is not None and not isinstance(fr, str):
@@ -166,13 +171,23 @@ def validate_verdict(verdict: Any) -> List[str]:
     ):
         if num_key in verdict and verdict[num_key] is not None:
             v = verdict[num_key]
-            if not isinstance(v, (int, float)) or isinstance(v, bool) or float(v) < 0.0:
-                errors.append(f"{num_key} must be non-negative number or null")
+            if (
+                not isinstance(v, (int, float))
+                or isinstance(v, bool)
+                or not math.isfinite(float(v))
+                or float(v) < 0.0
+            ):
+                errors.append(f"{num_key} must be non-negative finite number or null")
 
     if "pct_sol" in verdict and verdict["pct_sol"] is not None:
         ps = verdict["pct_sol"]
-        if not isinstance(ps, (int, float)) or isinstance(ps, bool) or not (0.0 <= float(ps) <= 1.0):
-            errors.append(f"pct_sol must be in [0.0, 1.0] or null: {ps!r}")
+        if (
+            not isinstance(ps, (int, float))
+            or isinstance(ps, bool)
+            or not math.isfinite(float(ps))
+            or not (0.0 <= float(ps) <= 1.0)
+        ):
+            errors.append(f"pct_sol must be finite in [0.0, 1.0] or null: {ps!r}")
 
     for int_key in ("sram_bytes", "sram_limit_bytes", "bytes_moved", "flops"):
         if int_key in verdict and verdict[int_key] is not None:

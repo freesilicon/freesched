@@ -889,6 +889,17 @@ static bool test_dmabuf_reconcile_and_router_pricing() {
   CHECK(rec.zero_copy_compatible == 0);
   CHECK(std::strstr(rec.conflict_reason, "coherency_mismatch") != nullptr);
 
+  /* 6c2: Non-power-of-two LCM alignment (48 & 64 -> 192) */
+  fs_buf_attr_t non_pow2[2] = {
+      fs_buf_attr_default(FS_DEV_GPU_VK),
+      fs_buf_attr_default(FS_DEV_TPU),
+  };
+  non_pow2[0].min_align = 48u;
+  non_pow2[1].min_align = 64u;
+  CHECK(fs_dmabuf_reconcile(non_pow2, 2u, &rec, &zc_ok) == FS_OK);
+  CHECK(zc_ok == 1);
+  CHECK(rec.min_align == 192u);
+
   /* 6d: Router upfront pricing for tiled PBE GPU output vs linear TPU */
   fs_config_t cfg = fs_config_default();
   cfg.mock_mode   = 1;
