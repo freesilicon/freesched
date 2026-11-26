@@ -8,6 +8,8 @@ add_library(freesched STATIC
   src/fs_dmabuf.cpp
   src/fs_router.cpp
   src/fs_executor.cpp
+  src/fs_backend_openbuenos.cpp
+  src/fs_backend_vulkan_dmabuf.cpp
   src/ggml_freesilicon.cpp
 )
 
@@ -28,16 +30,22 @@ target_include_directories(freesched
 
 if (UNIX AND NOT APPLE)
   if (ANDROID)
-    target_link_libraries(freesched PUBLIC m)
+    target_link_libraries(freesched PUBLIC m ${CMAKE_DL_LIBS})
   else()
-    target_link_libraries(freesched PUBLIC m pthread)
+    target_link_libraries(freesched PUBLIC m pthread ${CMAKE_DL_LIBS})
   endif()
 elseif (APPLE)
   target_link_libraries(freesched PUBLIC m)
 endif()
 
+add_executable(freesched_dmabuf_smoke tools/freesched_dmabuf_smoke.cpp)
+target_link_libraries(freesched_dmabuf_smoke PRIVATE freesched)
+target_compile_features(freesched_dmabuf_smoke PRIVATE cxx_std_17)
+target_compile_options(freesched_dmabuf_smoke PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+
 if (FREESCHED_BUILD_TESTS)
   enable_testing()
+  add_test(NAME freesched_dmabuf_smoke COMMAND freesched_dmabuf_smoke --profile laguna --json)
 
   add_executable(test_c11_abi tests/test_c11_abi.c)
   target_link_libraries(test_c11_abi PRIVATE freesched)

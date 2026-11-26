@@ -122,7 +122,19 @@ int main(void) {
   CHECK(rec_buf != NULL);
   CHECK(rec_buf->zero_copy_compatible == 1);
   CHECK(rec_buf->min_align == 128u);
+  CHECK(fs_buffer_dma_sync(ctx, rec_buf, FS_DMA_SYNC_END | FS_DMA_SYNC_RW) == FS_OK);
+  CHECK(rec_buf->dma_sync_count == 1u);
+  fs_fence_t sf = fs_fence_init(FS_DEV_GPU_VK);
+  CHECK(fs_buffer_export_sync_file(ctx, rec_buf, FS_DMA_SYNC_RW, &sf) == FS_OK);
+  CHECK(sf.state == FS_FENCE_SIGNALED);
+  fs_fence_close(&sf);
   fs_buffer_release(ctx, rec_buf);
+
+  /* Verify C11 optional backend adapter registration APIs */
+  fs_openbuenos_config_t ob_cfg = fs_openbuenos_config_default();
+  fs_vulkan_dmabuf_config_t vk_cfg = fs_vulkan_dmabuf_config_default();
+  CHECK(fs_backend_register_openbuenos(ctx, &ob_cfg) == FS_OK);
+  CHECK(fs_backend_register_vulkan_dmabuf(ctx, &vk_cfg) == FS_OK);
 
   fs_context_destroy(ctx);
 

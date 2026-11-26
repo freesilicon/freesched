@@ -68,9 +68,10 @@ size_t   fs_align_up(size_t value, size_t alignment);
 void fs_dmabuf_destroy_all(fs_context_t* ctx);
 fs_status_t fs_dmabuf_ensure_mapped(fs_context_t* ctx, fs_dmabuf_t* buf, fs_dev_t dev);
 
-/* Internal built-in backend installation */
+/* Internal built-in backend installation & reference math */
 fs_status_t fs_install_builtin_backends(fs_context_t* ctx);
 void        fs_shutdown_backends(fs_context_t* ctx);
+fs_status_t fs_ref_execute_any_internal(const fs_op_desc_t* op);
 
 /* Router internal helper */
 int fs_backend_supports_op_internal(const fs_context_t* ctx,

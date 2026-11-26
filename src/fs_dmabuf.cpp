@@ -19,10 +19,15 @@
 #include <unistd.h>
 
 #ifdef __linux__
-#include <sys/ioctl.h>
 #include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
 
-/* Portable Linux UAPI structs (avoid requiring kernel >= 5.6 headers) */
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
+/* Portable Linux UAPI structs (avoid requiring kernel >= 6.0 headers) */
 struct fs_dma_heap_allocation_data {
   uint64_t len;
   uint32_t fd;
@@ -34,16 +39,22 @@ struct fs_dma_buf_sync {
   uint64_t flags;
 };
 
+struct fs_dma_buf_export_sync_file {
+  uint32_t flags;
+  int32_t  fd;
+};
+
 #define FS_DMA_HEAP_IOC_MAGIC   'H'
 #define FS_DMA_HEAP_IOCTL_ALLOC _IOWR(FS_DMA_HEAP_IOC_MAGIC, 0x0, struct fs_dma_heap_allocation_data)
 
-#define FS_DMA_BUF_BASE         'b'
-#define FS_DMA_BUF_IOCTL_SYNC   _IOW(FS_DMA_BUF_BASE, 0, struct fs_dma_buf_sync)
-#define FS_DMA_BUF_SYNC_READ    (1ULL << 0)
-#define FS_DMA_BUF_SYNC_WRITE   (2ULL << 0)
-#define FS_DMA_BUF_SYNC_RW      (FS_DMA_BUF_SYNC_READ | FS_DMA_BUF_SYNC_WRITE)
-#define FS_DMA_BUF_SYNC_START   (0ULL << 2)
-#define FS_DMA_BUF_SYNC_END     (1ULL << 2)
+#define FS_DMA_BUF_BASE                   'b'
+#define FS_DMA_BUF_IOCTL_SYNC             _IOW(FS_DMA_BUF_BASE, 0, struct fs_dma_buf_sync)
+#define FS_DMA_BUF_IOCTL_EXPORT_SYNC_FILE _IOWR(FS_DMA_BUF_BASE, 2, struct fs_dma_buf_export_sync_file)
+#define FS_DMA_BUF_SYNC_READ              (1ULL << 0)
+#define FS_DMA_BUF_SYNC_WRITE             (2ULL << 0)
+#define FS_DMA_BUF_SYNC_RW                (FS_DMA_BUF_SYNC_READ | FS_DMA_BUF_SYNC_WRITE)
+#define FS_DMA_BUF_SYNC_START             (0ULL << 2)
+#define FS_DMA_BUF_SYNC_END               (1ULL << 2)
 #endif /* __linux__ */
 
 static fs_dmabuf_record* fs_record_from_pub(fs_dmabuf_t* buf) {
@@ -105,9 +116,41 @@ static fs_status_t fs_linux_dma_buf_sync(int dmabuf_fd, uint64_t flags) {
   }
   struct fs_dma_buf_sync sync_arg;
   sync_arg.flags = flags;
-  if (ioctl(dmabuf_fd, FS_DMA_BUF_IOCTL_SYNC, &sync_arg) != 0) {
+  int rc         = 0;
+  do {
+    rc = ioctl(dmabuf_fd, FS_DMA_BUF_IOCTL_SYNC, &sync_arg);
+  } while (rc != 0 && errno == EINTR);
+  if (rc != 0) {
     return FS_ERR_IOCTL;
   }
+  return FS_OK;
+}
+
+static fs_status_t fs_linux_export_sync_file(int dmabuf_fd, uint32_t rw_flags, int* out_sync_fd) {
+  if (!out_sync_fd) {
+    return FS_ERR_INVALID_ARG;
+  }
+  *out_sync_fd = -1;
+  if (dmabuf_fd < 0) {
+    return FS_OK;
+  }
+  struct fs_dma_buf_export_sync_file req;
+  std::memset(&req, 0, sizeof(req));
+  req.flags = (rw_flags != 0u) ? (rw_flags & static_cast<uint32_t>(FS_DMA_SYNC_RW))
+                               : static_cast<uint32_t>(FS_DMA_SYNC_RW);
+  req.fd    = -1;
+  int rc    = 0;
+  do {
+    rc = ioctl(dmabuf_fd, FS_DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &req);
+  } while (rc != 0 && errno == EINTR);
+  if (rc != 0) {
+    /* Older kernels (< 6.0) without DMA_BUF_IOCTL_EXPORT_SYNC_FILE return ENOTTY/EOPNOTSUPP */
+    if (errno == ENOTTY || errno == EOPNOTSUPP || errno == EINVAL) {
+      return FS_OK;
+    }
+    return FS_ERR_IOCTL;
+  }
+  *out_sync_fd = req.fd;
   return FS_OK;
 }
 
@@ -124,7 +167,10 @@ static fs_status_t fs_linux_alloc_dma_heap(const char* heap_path,
   std::memset(&req, 0, sizeof(req));
   req.len      = static_cast<uint64_t>(alloc_size);
   req.fd_flags = O_RDWR | O_CLOEXEC;
-  int rc       = ioctl(heap_fd, FS_DMA_HEAP_IOCTL_ALLOC, &req);
+  int rc       = 0;
+  do {
+    rc = ioctl(heap_fd, FS_DMA_HEAP_IOCTL_ALLOC, &req);
+  } while (rc != 0 && errno == EINTR);
   close(heap_fd);
   if (rc != 0) {
     return FS_ERR_IOCTL;
@@ -139,7 +185,71 @@ static fs_status_t fs_linux_alloc_dma_heap(const char* heap_path,
   *out_ptr = ptr;
   return FS_OK;
 }
+
+static fs_status_t fs_linux_alloc_memfd(size_t alloc_size, int* out_fd, void** out_ptr) {
+#ifdef SYS_memfd_create
+  long fd_res = syscall(SYS_memfd_create, "freesched_dmabuf", static_cast<unsigned int>(MFD_CLOEXEC));
+  if (fd_res < 0) {
+    return FS_ERR_DEVICE;
+  }
+  int fd = static_cast<int>(fd_res);
+  if (ftruncate(fd, static_cast<off_t>(alloc_size)) != 0) {
+    close(fd);
+    return FS_ERR_NO_MEMORY;
+  }
+  void* ptr = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (ptr == MAP_FAILED) {
+    close(fd);
+    return FS_ERR_NO_MEMORY;
+  }
+  *out_fd  = fd;
+  *out_ptr = ptr;
+  return FS_OK;
+#else
+  (void)alloc_size;
+  (void)out_fd;
+  (void)out_ptr;
+  return FS_ERR_UNSUPPORTED;
+#endif
+}
 #endif /* __linux__ */
+
+static fs_status_t fs_dma_sync_record_locked(fs_context_t*     ctx,
+                                             fs_dmabuf_record* rec,
+                                             uint32_t          sync_flags) {
+  if (!ctx || !rec) {
+    return FS_ERR_INVALID_ARG;
+  }
+  const uint32_t valid_mask =
+      static_cast<uint32_t>(FS_DMA_SYNC_RW) | static_cast<uint32_t>(FS_DMA_SYNC_END);
+  if ((sync_flags & ~valid_mask) != 0u || (sync_flags & static_cast<uint32_t>(FS_DMA_SYNC_RW)) == 0u) {
+    return FS_ERR_INVALID_ARG;
+  }
+#ifdef __linux__
+  if ((rec->pub.backing == FS_BACKING_DMA_HEAP || rec->pub.backing == FS_BACKING_IMPORTED) &&
+      rec->pub.dmabuf_fd >= 0) {
+    uint64_t kflags = 0ULL;
+    if ((sync_flags & static_cast<uint32_t>(FS_DMA_SYNC_READ)) != 0u) {
+      kflags |= FS_DMA_BUF_SYNC_READ;
+    }
+    if ((sync_flags & static_cast<uint32_t>(FS_DMA_SYNC_WRITE)) != 0u) {
+      kflags |= FS_DMA_BUF_SYNC_WRITE;
+    }
+    if ((sync_flags & static_cast<uint32_t>(FS_DMA_SYNC_END)) != 0u) {
+      kflags |= FS_DMA_BUF_SYNC_END;
+    } else {
+      kflags |= FS_DMA_BUF_SYNC_START;
+    }
+    fs_status_t st = fs_linux_dma_buf_sync(rec->pub.dmabuf_fd, kflags);
+    if (st != FS_OK) {
+      return st;
+    }
+  }
+#endif
+  rec->pub.dma_sync_count++;
+  ctx->telemetry.dma_sync_calls++;
+  return FS_OK;
+}
 
 fs_status_t fs_dmabuf_ensure_mapped(fs_context_t* ctx, fs_dmabuf_t* buf, fs_dev_t dev) {
   if (!ctx || !buf || !fs_dev_is_valid(dev)) {
@@ -420,6 +530,55 @@ fs_status_t fs_buffer_alloc_reconciled(fs_context_t*        ctx,
   return FS_OK;
 }
 
+fs_status_t fs_buffer_dma_sync(fs_context_t* ctx, fs_dmabuf_t* buf, uint32_t sync_flags) {
+  if (!ctx || !buf) {
+    return FS_ERR_INVALID_ARG;
+  }
+  std::lock_guard<std::mutex> lock(ctx->mu);
+  fs_dmabuf_record*           rec = fs_record_from_pub(buf);
+  if (!rec || rec->owner_ctx != ctx || rec->in_pool) {
+    return FS_ERR_INVALID_ARG;
+  }
+  return fs_dma_sync_record_locked(ctx, rec, sync_flags);
+}
+
+fs_status_t fs_buffer_export_sync_file(fs_context_t* ctx,
+                                       fs_dmabuf_t*  buf,
+                                       uint32_t      rw_flags,
+                                       fs_fence_t*   out_fence) {
+  if (!ctx || !buf || !out_fence) {
+    return FS_ERR_INVALID_ARG;
+  }
+  std::lock_guard<std::mutex> lock(ctx->mu);
+  fs_dmabuf_record*           rec = fs_record_from_pub(buf);
+  if (!rec || rec->owner_ctx != ctx || rec->in_pool) {
+    return FS_ERR_INVALID_ARG;
+  }
+
+  int sync_fd = -1;
+#ifdef __linux__
+  if ((rec->pub.backing == FS_BACKING_DMA_HEAP || rec->pub.backing == FS_BACKING_IMPORTED) &&
+      rec->pub.dmabuf_fd >= 0) {
+    fs_status_t st = fs_linux_export_sync_file(rec->pub.dmabuf_fd, rw_flags, &sync_fd);
+    if (st != FS_OK) {
+      fs_set_error(ctx, "DMA_BUF_IOCTL_EXPORT_SYNC_FILE failed on buf %llu",
+                   static_cast<unsigned long long>(rec->pub.buf_id));
+      return st;
+    }
+  }
+#else
+  (void)rw_flags;
+#endif
+
+  *out_fence                = fs_fence_init(rec->pub.owner_dev);
+  out_fence->seq            = ++ctx->next_fence_seq;
+  out_fence->sync_file_fd   = sync_fd;
+  out_fence->state          = FS_FENCE_SIGNALED;
+  out_fence->signaled_at_us = fs_now_us();
+  ctx->telemetry.sync_file_exports++;
+  return FS_OK;
+}
+
 fs_fence_t fs_fence_init(fs_dev_t producer_dev) {
   fs_fence_t f;
   std::memset(&f, 0, sizeof(f));
@@ -455,7 +614,10 @@ fs_status_t fs_fence_wait(const fs_fence_t* fence, uint32_t timeout_ms) {
     pfd.fd      = fence->sync_file_fd;
     pfd.events  = POLLIN;
     pfd.revents = 0;
-    int rc      = poll(&pfd, 1, static_cast<int>(timeout_ms));
+    int rc      = 0;
+    do {
+      rc = poll(&pfd, 1, static_cast<int>(timeout_ms));
+    } while (rc < 0 && errno == EINTR);
     if (rc < 0) {
       return FS_ERR_IO;
     }
@@ -474,6 +636,16 @@ fs_status_t fs_fence_wait(const fs_fence_t* fence, uint32_t timeout_ms) {
     return FS_ERR_FENCE;
   }
   return FS_OK;
+}
+
+void fs_fence_close(fs_fence_t* fence) {
+  if (!fence) {
+    return;
+  }
+  if (fence->sync_file_fd >= 0) {
+    close(fence->sync_file_fd);
+    fence->sync_file_fd = -1;
+  }
 }
 
 fs_status_t fs_buffer_alloc(fs_context_t* ctx,
@@ -516,6 +688,7 @@ fs_status_t fs_buffer_alloc(fs_context_t* ctx,
         rec->pub.min_align            = 64u;
         rec->pub.stride_align         = 64u;
         rec->pub.zero_copy_compatible = ((flags & FS_BUF_FORCE_HOST_COPY) == 0u) ? 1 : 0;
+        rec->pub.dma_sync_count       = 0u;
 
         if ((flags & FS_BUF_ZERO_INIT) != 0u && rec->pub.host_ptr) {
           std::memset(rec->pub.host_ptr, 0, size_bytes);
@@ -536,17 +709,19 @@ fs_status_t fs_buffer_alloc(fs_context_t* ctx,
     return FS_ERR_NO_MEMORY;
   }
 
-  int   dmabuf_fd = -1;
-  void* host_ptr  = nullptr;
+  int              dmabuf_fd = -1;
+  void*            host_ptr  = nullptr;
+  fs_buf_backing_t backing   = FS_BACKING_ANON_MMAP;
 
 #ifdef __linux__
   if (!ctx->mock_mode) {
     fs_status_t st =
         fs_linux_alloc_dma_heap(ctx->config.dma_heap_path, alloc_size, &dmabuf_fd, &host_ptr);
-    if (st != FS_OK) {
-      std::free(rec);
-      fs_set_error(ctx, "DMA-BUF heap allocation failed (%s)", fs_status_string(st));
-      return st;
+    if (st == FS_OK) {
+      backing = FS_BACKING_DMA_HEAP;
+    } else if (fs_linux_alloc_memfd(alloc_size, &dmabuf_fd, &host_ptr) == FS_OK) {
+      /* Graceful unprivileged Linux fallback to fd-backed shared memory */
+      backing = FS_BACKING_MEMFD;
     }
   }
 #endif
@@ -558,6 +733,7 @@ fs_status_t fs_buffer_alloc(fs_context_t* ctx,
       fs_set_error(ctx, "mmap failed allocating %zu bytes", alloc_size);
       return FS_ERR_NO_MEMORY;
     }
+    backing = FS_BACKING_ANON_MMAP;
   }
 
   if ((flags & FS_BUF_ZERO_INIT) != 0u) {
@@ -594,6 +770,8 @@ fs_status_t fs_buffer_alloc(fs_context_t* ctx,
   rec->pub.min_align            = 64u;
   rec->pub.stride_align         = 64u;
   rec->pub.zero_copy_compatible = ((flags & FS_BUF_FORCE_HOST_COPY) == 0u) ? 1 : 0;
+  rec->pub.backing              = backing;
+  rec->pub.dma_sync_count       = 0u;
 
   ctx->live_buffers.push_back(rec);
   *out_buf = &rec->pub;
@@ -649,6 +827,8 @@ fs_status_t fs_buffer_import_dmabuf(fs_context_t* ctx,
   rec->pub.min_align            = 64u;
   rec->pub.stride_align         = 64u;
   rec->pub.zero_copy_compatible = ((flags & FS_BUF_FORCE_HOST_COPY) == 0u) ? 1 : 0;
+  rec->pub.backing              = FS_BACKING_IMPORTED;
+  rec->pub.dma_sync_count       = 0u;
 
   ctx->live_buffers.push_back(rec);
   *out_buf = &rec->pub;
@@ -742,12 +922,45 @@ fs_status_t fs_buffer_handoff(fs_context_t* ctx,
       return FS_OK;
     }
 
+    const int force_copy = ((rec->pub.flags & FS_BUF_FORCE_HOST_COPY) != 0u) ||
+                           ((ctx->topo.global_caps & FS_CAP_DMABUF) == 0u);
+
+    /* Upfront reconciliation guard: fail closed on incompatible tiled layouts unless copy-marked */
+    if (!force_copy && rec->pub.layout != FS_LAYOUT_ANY) {
+      fs_buf_attr_t pair[2];
+      pair[0]                = fs_buf_attr_default(from_dev);
+      pair[0].layout         = rec->pub.layout;
+      pair[0].layout_mask    = FS_LAYOUT_BIT(rec->pub.layout);
+      pair[0].coherency      = rec->pub.coherency;
+      pair[0].coherency_mask = (rec->pub.coherency != FS_COHERENCY_ANY)
+                                   ? FS_COHERENCY_BIT(rec->pub.coherency)
+                                   : 0u;
+      pair[1]                = fs_buf_attr_default(to_dev);
+
+      fs_buf_reconciled_t rcheck;
+      int                 zc_ok = 1;
+      if (fs_dmabuf_reconcile(pair, 2u, &rcheck, &zc_ok) != FS_OK || !zc_ok) {
+        fs_set_error(ctx, "handoff %s -> %s rejected on buf %llu: %s", fs_dev_name(from_dev),
+                     fs_dev_name(to_dev), static_cast<unsigned long long>(rec->pub.buf_id),
+                     rcheck.conflict_reason[0] != '\0' ? rcheck.conflict_reason : "incompatible");
+        return FS_ERR_UNSUPPORTED;
+      }
+    }
+
     /* Validate / advance explicit sync_file fence */
     if (io_fence) {
       if (io_fence->state == FS_FENCE_ERROR) {
         fs_set_error(ctx, "cannot handoff buf %llu with errored fence",
                      static_cast<unsigned long long>(rec->pub.buf_id));
         return FS_ERR_FENCE;
+      }
+      if (io_fence->sync_file_fd >= 0) {
+        fs_status_t wst = fs_fence_wait(io_fence, 5000u);
+        if (wst != FS_OK) {
+          fs_set_error(ctx, "sync_file fence wait failed on buf %llu (%s)",
+                       static_cast<unsigned long long>(rec->pub.buf_id), fs_status_string(wst));
+          return wst;
+        }
       }
       if (io_fence->state == FS_FENCE_UNSIGNALED) {
         io_fence->producer_dev   = from_dev;
@@ -765,11 +978,12 @@ fs_status_t fs_buffer_handoff(fs_context_t* ctx,
       rec->pub.sync_file_fd          = -1;
     }
 
-#ifdef __linux__
-    if (!ctx->mock_mode && rec->pub.dmabuf_fd >= 0) {
+    /* Non-coherent DMA-BUF cache maintenance (critical for PowerVR Volcanic GPU <-> TPU <-> CPU) */
+    if (rec->pub.coherency != FS_COHERENCY_COHERENT) {
       if (fs_dev_is_cpu(from_dev)) {
-        fs_status_t st =
-            fs_linux_dma_buf_sync(rec->pub.dmabuf_fd, FS_DMA_BUF_SYNC_END | FS_DMA_BUF_SYNC_RW);
+        fs_status_t st = fs_dma_sync_record_locked(
+            ctx, rec,
+            static_cast<uint32_t>(FS_DMA_SYNC_END) | static_cast<uint32_t>(FS_DMA_SYNC_RW));
         if (st != FS_OK) {
           fs_set_error(ctx, "DMA_BUF_IOCTL_SYNC(END) failed on buf %llu",
                        static_cast<unsigned long long>(rec->pub.buf_id));
@@ -777,19 +991,46 @@ fs_status_t fs_buffer_handoff(fs_context_t* ctx,
         }
       }
       if (fs_dev_is_cpu(to_dev)) {
-        fs_status_t st =
-            fs_linux_dma_buf_sync(rec->pub.dmabuf_fd, FS_DMA_BUF_SYNC_START | FS_DMA_BUF_SYNC_RW);
+        fs_status_t st = fs_dma_sync_record_locked(
+            ctx, rec,
+            static_cast<uint32_t>(FS_DMA_SYNC_START) | static_cast<uint32_t>(FS_DMA_SYNC_RW));
         if (st != FS_OK) {
           fs_set_error(ctx, "DMA_BUF_IOCTL_SYNC(START) failed on buf %llu",
                        static_cast<unsigned long long>(rec->pub.buf_id));
           return st;
         }
       }
-    }
+      if (!fs_dev_is_cpu(from_dev) && !fs_dev_is_cpu(to_dev)) {
+        /* Accelerator-to-accelerator non-coherent boundary sync + optional sync_file export */
+        fs_status_t st = fs_dma_sync_record_locked(
+            ctx, rec,
+            static_cast<uint32_t>(FS_DMA_SYNC_END) | static_cast<uint32_t>(FS_DMA_SYNC_RW));
+        if (st == FS_OK) {
+          st = fs_dma_sync_record_locked(
+              ctx, rec,
+              static_cast<uint32_t>(FS_DMA_SYNC_START) | static_cast<uint32_t>(FS_DMA_SYNC_RW));
+        }
+        if (st != FS_OK) {
+          fs_set_error(ctx, "accelerator DMA_BUF_IOCTL_SYNC failed on buf %llu",
+                       static_cast<unsigned long long>(rec->pub.buf_id));
+          return st;
+        }
+#ifdef __linux__
+        if ((rec->pub.backing == FS_BACKING_DMA_HEAP || rec->pub.backing == FS_BACKING_IMPORTED) &&
+            rec->pub.dmabuf_fd >= 0 && io_fence && io_fence->sync_file_fd < 0) {
+          int exp_fd = -1;
+          if (fs_linux_export_sync_file(rec->pub.dmabuf_fd, static_cast<uint32_t>(FS_DMA_SYNC_RW),
+                                        &exp_fd) == FS_OK &&
+              exp_fd >= 0) {
+            io_fence->sync_file_fd = exp_fd;
+            rec->pub.sync_file_fd  = exp_fd;
+            ctx->telemetry.sync_file_exports++;
+          }
+        }
 #endif
+      }
+    }
 
-    const int force_copy = ((rec->pub.flags & FS_BUF_FORCE_HOST_COPY) != 0u) ||
-                           ((ctx->topo.global_caps & FS_CAP_DMABUF) == 0u);
     if (force_copy) {
       /* Simulate host bounce copy when DMA-BUF is unavailable or forced for diagnostics */
       if (rec->pub.host_ptr && rec->pub.size > 0u) {
@@ -815,7 +1056,16 @@ fs_status_t fs_buffer_handoff(fs_context_t* ctx,
   }
 
   /* Ensure target device has zero-copy mapping (EDGETPU_MAP_DMABUF / VK_KHR_external_memory_fd) */
-  return fs_dmabuf_ensure_mapped(ctx, buf, to_dev);
+  fs_status_t map_st = fs_dmabuf_ensure_mapped(ctx, buf, to_dev);
+  if (map_st != FS_OK) {
+    /* Roll back ownership atomically if backend import rejects the buffer */
+    std::lock_guard<std::mutex> lock(ctx->mu);
+    fs_dmabuf_record*           rec = fs_record_from_pub(buf);
+    if (rec && rec->owner_ctx == ctx) {
+      rec->pub.owner_dev = from_dev;
+    }
+  }
+  return map_st;
 }
 
 fs_status_t fs_buffer_acquire_access(fs_context_t* ctx,

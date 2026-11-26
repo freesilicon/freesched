@@ -364,6 +364,10 @@ static fs_status_t fs_ref_execute_any(const fs_op_desc_t* op) {
   }
 }
 
+fs_status_t fs_ref_execute_any_internal(const fs_op_desc_t* op) {
+  return fs_ref_execute_any(op);
+}
+
 /* =========================================================================
  * Built-in Mock TPU / Mock Vulkan GPU / Real CPU Reference Backends
  * ========================================================================= */
@@ -766,9 +770,28 @@ fs_status_t fs_context_register_backend(fs_context_t* ctx, const fs_backend_ops_
     return FS_ERR_INVALID_ARG;
   }
   std::lock_guard<std::mutex> lock(ctx->mu);
-  fs_backend_slot&            slot = ctx->backends[ops->dev];
-  if (slot.registered && slot.ops.shutdown) {
-    slot.ops.shutdown(slot.ops.user_data);
+  fs_backend_slot&            slot    = ctx->backends[ops->dev];
+  const uint32_t              dev_bit = (1u << static_cast<uint32_t>(ops->dev));
+  if (slot.registered) {
+    for (fs_dmabuf_record* rec : ctx->live_buffers) {
+      if ((rec->mapped_dev_mask & dev_bit) != 0u) {
+        if (slot.ops.release_dmabuf) {
+          slot.ops.release_dmabuf(slot.ops.user_data, &rec->pub);
+        }
+        rec->mapped_dev_mask &= ~dev_bit;
+      }
+    }
+    for (fs_dmabuf_record* rec : ctx->pooled_buffers) {
+      if ((rec->mapped_dev_mask & dev_bit) != 0u) {
+        if (slot.ops.release_dmabuf) {
+          slot.ops.release_dmabuf(slot.ops.user_data, &rec->pub);
+        }
+        rec->mapped_dev_mask &= ~dev_bit;
+      }
+    }
+    if (slot.ops.shutdown) {
+      slot.ops.shutdown(slot.ops.user_data);
+    }
   }
   slot.ops        = *ops;
   slot.registered = 1;

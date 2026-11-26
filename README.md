@@ -56,6 +56,9 @@ Works out of the box on macOS and Linux using `FREESCHED_MOCK=1`:
 ```bash
 # Make (zero external dependencies beyond clang/make)
 make verify
+
+# Run the Linux / ARM64 / host zero-copy DMA-BUF smoke tool directly
+./build/freesched_dmabuf_smoke --profile laguna --json
 ```
 
 Or with CMake + Ninja:

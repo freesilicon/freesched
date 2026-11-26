@@ -198,6 +198,22 @@ enum fs_buf_access_flags {
   FS_ACCESS_READ_WRITE = (FS_ACCESS_READ | FS_ACCESS_WRITE)
 };
 
+typedef enum fs_buf_backing {
+  FS_BACKING_ANON_MMAP = 0, /* Portable POSIX anonymous mmap (host mock) */
+  FS_BACKING_MEMFD     = 1, /* Linux memfd_create fallback when unprivileged */
+  FS_BACKING_DMA_HEAP  = 2, /* Real Linux /dev/dma_heap/system DMA-BUF */
+  FS_BACKING_IMPORTED  = 3  /* Externally imported dmabuf_fd */
+} fs_buf_backing_t;
+
+/* Explicit DMA_BUF_IOCTL_SYNC flags (mirrors Linux linux/dma-buf.h) */
+enum fs_dma_sync_flags {
+  FS_DMA_SYNC_START = 0u,
+  FS_DMA_SYNC_READ  = (1u << 0),
+  FS_DMA_SYNC_WRITE = (1u << 1),
+  FS_DMA_SYNC_RW    = (FS_DMA_SYNC_READ | FS_DMA_SYNC_WRITE),
+  FS_DMA_SYNC_END   = (1u << 2)
+};
+
 #define FS_LAYOUT_BIT(layout_enum)       (1u << (uint32_t)(layout_enum))
 #define FS_COHERENCY_BIT(coherency_enum) (1u << (uint32_t)(coherency_enum))
 
@@ -263,6 +279,8 @@ typedef struct fs_dmabuf {
   size_t             min_align;            /* Reconciled base alignment in bytes */
   size_t             stride_align;         /* Reconciled row stride alignment in bytes */
   int                zero_copy_compatible; /* 1 if reconciled for zero-copy sharing */
+  fs_buf_backing_t   backing;              /* Physical backing transport kind */
+  uint64_t           dma_sync_count;       /* Explicit DMA_BUF_IOCTL_SYNC count on this buffer */
 } fs_dmabuf_t;
 
 /* =========================================================================
@@ -363,6 +381,8 @@ typedef struct fs_telemetry {
   uint64_t cpu_ops;
   float    est_watts;
   float    total_energy_mj;
+  uint64_t dma_sync_calls;    /* Cumulative DMA_BUF_IOCTL_SYNC / cache-sync calls */
+  uint64_t sync_file_exports; /* Cumulative DMA_BUF_IOCTL_EXPORT_SYNC_FILE calls */
 } fs_telemetry_t;
 
 typedef struct fs_parity {
@@ -416,6 +436,26 @@ typedef struct fs_backend_ops {
                             uint64_t*           out_hw_us);
 } fs_backend_ops_t;
 
+/* Optional real backend adapter configurations (zero hard vendor deps) */
+typedef struct fs_openbuenos_config {
+  uint32_t    struct_size;         /* Optional: sizeof(fs_openbuenos_config_t) or 0 */
+  const char* library_path;        /* NULL -> probe libopenbuenos.so / host fallback */
+  const char* device_path;         /* NULL -> "/dev/edgetpu-soc" */
+  const char* dma_heap_path;       /* NULL -> "/dev/dma_heap/system" */
+  int         allow_mock_fallback; /* 1 = run exact host reference if TPU/lib absent */
+  uint8_t     perf_mode;           /* 0..5 DVFS tier matching ob_config_t::perf_mode */
+  uint8_t     reserved[3];
+} fs_openbuenos_config_t;
+
+typedef struct fs_vulkan_dmabuf_config {
+  uint32_t    struct_size;           /* Optional: sizeof(fs_vulkan_dmabuf_config_t) or 0 */
+  const char* loader_path;           /* NULL -> "libvulkan.so.1" / "libvulkan.so" */
+  const char* preferred_driver;      /* Optional ICD filter substring (e.g. "pvr", "PowerVR") */
+  int         require_dmabuf_ext;    /* 1 = require VK_EXT_external_memory_dma_buf */
+  int         allow_mock_fallback;   /* 1 = run exact host reference if Vulkan ICD absent */
+  int         require_linear_layout; /* 1 = fail closed on tiled buffers during import */
+} fs_vulkan_dmabuf_config_t;
+
 /* =========================================================================
  * Topology & Diagnostics API
  * ========================================================================= */
@@ -444,6 +484,15 @@ fs_status_t            fs_context_set_device_enabled(fs_context_t* ctx,
                                                      int           enabled);
 fs_status_t            fs_context_register_backend(fs_context_t*           ctx,
                                                    const fs_backend_ops_t* ops);
+
+/* Optional hardware backend adapter seams (dynamic/zero hard vendor deps) */
+fs_openbuenos_config_t    fs_openbuenos_config_default(void);
+fs_vulkan_dmabuf_config_t fs_vulkan_dmabuf_config_default(void);
+
+fs_status_t fs_backend_register_openbuenos(fs_context_t*                 ctx,
+                                           const fs_openbuenos_config_t* cfg);
+fs_status_t fs_backend_register_vulkan_dmabuf(fs_context_t*                    ctx,
+                                              const fs_vulkan_dmabuf_config_t* cfg);
 
 /* =========================================================================
  * Zero-Copy DMA-BUF Buffer Pool, Reconciliation & Ownership Handoff API
@@ -528,10 +577,18 @@ fs_status_t fs_buffer_pool_stats(const fs_context_t* ctx,
                                  uint64_t*           out_pool_hits,
                                  uint64_t*           out_pool_misses);
 
+/* Explicit DMA-BUF cache sync & sync_file fence export */
+fs_status_t fs_buffer_dma_sync(fs_context_t* ctx, fs_dmabuf_t* buf, uint32_t sync_flags);
+fs_status_t fs_buffer_export_sync_file(fs_context_t* ctx,
+                                       fs_dmabuf_t*  buf,
+                                       uint32_t      rw_flags,
+                                       fs_fence_t*   out_fence);
+
 /* Fence helpers */
 fs_fence_t  fs_fence_init(fs_dev_t producer_dev);
 fs_status_t fs_fence_signal(fs_fence_t* fence, int sync_file_fd);
 fs_status_t fs_fence_wait(const fs_fence_t* fence, uint32_t timeout_ms);
+void        fs_fence_close(fs_fence_t* fence);
 
 /* =========================================================================
  * Scheduler Plan, Execution & Telemetry API
