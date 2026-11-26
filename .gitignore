@@ -1,7 +1,13 @@
 build/
+build-cmake/
 build-*/
+dist/
+*.egg-info/
+python/*.egg-info/
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv*/
 *.o
 *.a
 *.so

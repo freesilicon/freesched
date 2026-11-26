@@ -1,0 +1,28 @@
+{
+  "profile_version": "freesilicon.profile.v1",
+  "name": "buenos-a0",
+  "soc": "laguna",
+  "schema_target": "buenos-a0",
+  "accelerator": "BUENOS_A0 EdgeTPU (Tensor G5)",
+  "aliases": ["buenos_a0"],
+  "ram_bytes": 17179869184,
+  "sram_limit_bytes": 2097152,
+  "prefill_m_threshold": 32,
+  "sme2": false,
+  "tpu_tops": 12.0,
+  "tpu_watts": 1.8,
+  "tpu_launch_us": 18.0,
+  "gpu_gflops": 2400.0,
+  "gpu_watts": 4.5,
+  "gpu_launch_us": 65.0,
+  "cpu_gflops": 240.0,
+  "cpu_watts": 2.6,
+  "cpu_launch_us": 3.0,
+  "mem_bw_gbps": 48.0,
+  "eff_bw_ratio": 0.56,
+  "handoff_us": 8.0,
+  "calibration": {
+    "receipt": "tensor-g5-swiglu-b1.json",
+    "verified_error_pct": 0.007707
+  }
+}
