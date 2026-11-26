@@ -20,11 +20,16 @@ SRCS := \
 	$(THIS_DIR)/src/fs_executor.cpp \
 	$(THIS_DIR)/src/fs_backend_openbuenos.cpp \
 	$(THIS_DIR)/src/fs_backend_vulkan_dmabuf.cpp \
-	$(THIS_DIR)/src/ggml_freesilicon.cpp
+	$(THIS_DIR)/src/ggml_freesilicon.cpp \
+	$(THIS_DIR)/src/pc_gguf.cpp \
+	$(THIS_DIR)/src/pc_kv_ring.cpp \
+	$(THIS_DIR)/src/pc_soa_neon.cpp \
+	$(THIS_DIR)/src/pc_dmabuf_graph.cpp
 
 HDRS := \
 	$(THIS_DIR)/include/freesched.h \
 	$(THIS_DIR)/include/ggml_freesilicon.h \
+	$(THIS_DIR)/include/pocketcoder_runner.h \
 	$(THIS_DIR)/src/fs_internal.h
 
 OBJS := $(patsubst $(THIS_DIR)/src/%.cpp,$(BUILD_DIR)/obj/%.o,$(SRCS))
@@ -32,12 +37,14 @@ OBJS := $(patsubst $(THIS_DIR)/src/%.cpp,$(BUILD_DIR)/obj/%.o,$(SRCS))
 LIB        := $(BUILD_DIR)/libfreesched.a
 TEST_C11   := $(BUILD_DIR)/test_c11_abi
 TEST_CXX   := $(BUILD_DIR)/test_freesched
+TEST_PC    := $(BUILD_DIR)/test_pocketcoder
 BENCH_BIN  := $(BUILD_DIR)/bench_heterogeneous
 SMOKE_BIN  := $(BUILD_DIR)/freesched_dmabuf_smoke
+PC_BIN     := $(BUILD_DIR)/pocketcoder-run
 
 .PHONY: all lib test twin-test smoke bench verify-headers audit verify clean
 
-all: lib $(TEST_C11) $(TEST_CXX) $(BENCH_BIN) $(SMOKE_BIN)
+all: lib $(TEST_C11) $(TEST_CXX) $(TEST_PC) $(BENCH_BIN) $(SMOKE_BIN) $(PC_BIN)
 
 lib: $(LIB)
 
@@ -49,12 +56,16 @@ $(LIB): $(OBJS)
 	@mkdir -p $(dir $@)
 	$(HOST_AR) rcs $@ $(OBJS)
 
-$(TEST_C11): $(THIS_DIR)/tests/test_c11_abi.c $(LIB) $(THIS_DIR)/include/freesched.h $(THIS_DIR)/include/ggml_freesilicon.h
+$(TEST_C11): $(THIS_DIR)/tests/test_c11_abi.c $(LIB) $(THIS_DIR)/include/freesched.h $(THIS_DIR)/include/ggml_freesilicon.h $(THIS_DIR)/include/pocketcoder_runner.h
 	@mkdir -p $(dir $@)
 	$(HOST_CC) $(CFLAGS) -c $< -o $(BUILD_DIR)/obj/test_c11_abi.o
 	$(HOST_CXX) $(BUILD_DIR)/obj/test_c11_abi.o $(LIB) -o $@ $(LDFLAGS)
 
 $(TEST_CXX): $(THIS_DIR)/tests/test_freesched.cpp $(LIB) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOST_CXX) $(CXXFLAGS) $< $(LIB) -o $@ $(LDFLAGS)
+
+$(TEST_PC): $(THIS_DIR)/tests/test_pocketcoder.cpp $(LIB) $(HDRS)
 	@mkdir -p $(dir $@)
 	$(HOST_CXX) $(CXXFLAGS) $< $(LIB) -o $@ $(LDFLAGS)
 
@@ -66,15 +77,23 @@ $(SMOKE_BIN): $(THIS_DIR)/tools/freesched_dmabuf_smoke.cpp $(LIB) $(HDRS)
 	@mkdir -p $(dir $@)
 	$(HOST_CXX) $(CXXFLAGS) $< $(LIB) -o $@ $(LDFLAGS)
 
-verify-headers: $(THIS_DIR)/include/freesched.h $(THIS_DIR)/include/ggml_freesilicon.h
+$(PC_BIN): $(THIS_DIR)/tools/pocketcoder_run.cpp $(LIB) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(HOST_CXX) $(CXXFLAGS) $< $(LIB) -o $@ $(LDFLAGS)
+
+verify-headers: $(THIS_DIR)/include/freesched.h $(THIS_DIR)/include/ggml_freesilicon.h $(THIS_DIR)/include/pocketcoder_runner.h
 	$(HOST_CC) -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror -I$(THIS_DIR)/include $(THIS_DIR)/include/freesched.h
 	$(HOST_CXX) -x c++ -std=c++17 -fsyntax-only -Wall -Wextra -Werror -I$(THIS_DIR)/include $(THIS_DIR)/include/freesched.h
 	$(HOST_CC) -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror -I$(THIS_DIR)/include $(THIS_DIR)/include/ggml_freesilicon.h
 	$(HOST_CXX) -x c++ -std=c++17 -fsyntax-only -Wall -Wextra -Werror -I$(THIS_DIR)/include $(THIS_DIR)/include/ggml_freesilicon.h
+	$(HOST_CC) -x c -std=c11 -fsyntax-only -Wall -Wextra -Werror -I$(THIS_DIR)/include $(THIS_DIR)/include/pocketcoder_runner.h
+	$(HOST_CXX) -x c++ -std=c++17 -fsyntax-only -Wall -Wextra -Werror -I$(THIS_DIR)/include $(THIS_DIR)/include/pocketcoder_runner.h
 
-test: $(TEST_C11) $(TEST_CXX) $(BENCH_BIN) $(SMOKE_BIN) twin-test
+test: $(TEST_C11) $(TEST_CXX) $(TEST_PC) $(BENCH_BIN) $(SMOKE_BIN) $(PC_BIN) twin-test
 	FREESCHED_MOCK=1 $(TEST_C11)
 	FREESCHED_MOCK=1 $(TEST_CXX)
+	FREESCHED_MOCK=1 $(TEST_PC)
+	$(PC_BIN) --bench-synthetic --iters 20
 	$(SMOKE_BIN) --profile laguna --json
 	$(SMOKE_BIN) --profile malibu --mock --json
 

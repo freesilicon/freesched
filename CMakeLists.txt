@@ -11,6 +11,10 @@ add_library(freesched STATIC
   src/fs_backend_openbuenos.cpp
   src/fs_backend_vulkan_dmabuf.cpp
   src/ggml_freesilicon.cpp
+  src/pc_gguf.cpp
+  src/pc_kv_ring.cpp
+  src/pc_soa_neon.cpp
+  src/pc_dmabuf_graph.cpp
 )
 
 add_library(freesched::freesched ALIAS freesched)
@@ -43,9 +47,15 @@ target_link_libraries(freesched_dmabuf_smoke PRIVATE freesched)
 target_compile_features(freesched_dmabuf_smoke PRIVATE cxx_std_17)
 target_compile_options(freesched_dmabuf_smoke PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
 
+add_executable(pocketcoder-run tools/pocketcoder_run.cpp)
+target_link_libraries(pocketcoder-run PRIVATE freesched)
+target_compile_features(pocketcoder-run PRIVATE cxx_std_17)
+target_compile_options(pocketcoder-run PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+
 if (FREESCHED_BUILD_TESTS)
   enable_testing()
   add_test(NAME freesched_dmabuf_smoke COMMAND freesched_dmabuf_smoke --profile laguna --json)
+  add_test(NAME pocketcoder_run_bench_synthetic COMMAND pocketcoder-run --bench-synthetic --iters 20)
 
   add_executable(test_c11_abi tests/test_c11_abi.c)
   target_link_libraries(test_c11_abi PRIVATE freesched)
@@ -62,6 +72,12 @@ if (FREESCHED_BUILD_TESTS)
   target_compile_features(test_freesched PRIVATE cxx_std_17)
   target_compile_options(test_freesched PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
   add_test(NAME test_freesched COMMAND test_freesched)
+
+  add_executable(test_pocketcoder tests/test_pocketcoder.cpp)
+  target_link_libraries(test_pocketcoder PRIVATE freesched)
+  target_compile_features(test_pocketcoder PRIVATE cxx_std_17)
+  target_compile_options(test_pocketcoder PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
+  add_test(NAME test_pocketcoder COMMAND test_pocketcoder)
 
   add_executable(bench_heterogeneous tests/bench_heterogeneous.cpp)
   target_link_libraries(bench_heterogeneous PRIVATE freesched)

@@ -36,6 +36,7 @@ jobs:
           FREESCHED_MOCK=1 ctest --test-dir build-cmake --output-on-failure
           FREESCHED_MOCK=1 ./build-cmake/bench_heterogeneous
           ./build-cmake/freesched_dmabuf_smoke --profile laguna --json
+          ./build-cmake/pocketcoder-run --bench-synthetic --iters 20
 
       - name: Build, test & benchmark with Make
         run: |

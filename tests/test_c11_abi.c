@@ -6,6 +6,7 @@
  */
 #include "freesched.h"
 #include "ggml_freesilicon.h"
+#include "pocketcoder_runner.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -144,6 +145,13 @@ int main(void) {
   CHECK(strcmp(ggml_fs_backend_name(gg), "FreeSilicon") == 0);
   CHECK(ggml_fs_backend_is_mock(gg) == 1);
   ggml_fs_backend_free(gg);
+
+  /* Verify pocketcoder_runner C11 ABI types & graph config */
+  pc_graph_config_t pc_cfg = pc_graph_config_default();
+  CHECK(pc_cfg.hidden_dim == 2304u);
+  CHECK(pc_cfg.expert_ffn_dim == 1152u);
+  CHECK(pc_ggml_type_block_elems(PC_GGML_TYPE_IQ4_XS) == 256u);
+  CHECK(pc_ggml_type_block_bytes(PC_GGML_TYPE_IQ4_XS) == 136u);
 
   printf("[PASS] test_c11_abi: pure C11 header + runtime ABI verified.\n");
   return 0;
