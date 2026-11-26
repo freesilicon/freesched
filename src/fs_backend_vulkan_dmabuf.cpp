@@ -98,7 +98,7 @@ struct fs_vulkan_dmabuf_state {
   int                       has_ext_memory_dmabuf;
   int                       has_ext_semaphore_fd;
   int                       hw_probe_ok;
-  char                      driver_name[FS_MAX_NAME_LEN];
+  char                      driver_name[256];
 };
 
 static int fs_vulkan_check_buf_compatible(const fs_vulkan_dmabuf_state* st,
@@ -214,7 +214,7 @@ static fs_status_t fs_vulkan_dmabuf_init(void* user_data, const fs_topology_t* t
                     st->has_ext_memory_dmabuf = has_dmabuf;
                     st->has_ext_semaphore_fd  = has_sem_fd;
                     st->hw_probe_ok           = 1;
-                    std::snprintf(st->driver_name, sizeof(st->driver_name), "%s", props.deviceName);
+                    std::snprintf(st->driver_name, sizeof(st->driver_name), "%.255s", props.deviceName);
                     break;
                   }
                 }
