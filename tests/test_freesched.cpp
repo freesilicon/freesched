@@ -843,6 +843,132 @@ static bool test_custom_vtable_and_ggml_seam() {
   return true;
 }
 
+/* =========================================================================
+ * Test 6: NvSciBuf-Style Upfront Buffer Reconciliation & Router Copy Pricing
+ * ========================================================================= */
+static bool test_dmabuf_reconcile_and_router_pricing() {
+  /* 6a: Compatible 3-engine intersection (GPU + TPU + CPU_SME2) -> 128B linear non-coherent */
+  fs_buf_attr_t compat[3] = {
+      fs_buf_attr_default(FS_DEV_GPU_VK),
+      fs_buf_attr_default(FS_DEV_TPU),
+      fs_buf_attr_default(FS_DEV_CPU_SME2),
+  };
+  fs_buf_reconciled_t rec;
+  int                 zc_ok = 0;
+  CHECK(fs_dmabuf_reconcile(compat, 3u, &rec, &zc_ok) == FS_OK);
+  CHECK(zc_ok == 1);
+  CHECK(rec.zero_copy_compatible == 1);
+  CHECK(rec.min_align == 128u);
+  CHECK(rec.stride_align == 64u);
+  CHECK(rec.layout == FS_LAYOUT_LINEAR);
+  CHECK(rec.coherency == FS_COHERENCY_NON_COHERENT);
+  CHECK(rec.requires_dma_sync == 1);
+  CHECK(rec.conflict_reason[0] == '\0');
+
+  /* 6b: Incompatible layout (tiled PBE GPU output vs linear TPU input) */
+  fs_buf_attr_t tiled_vs_linear[2] = {
+      fs_buf_attr_default(FS_DEV_GPU_VK),
+      fs_buf_attr_default(FS_DEV_TPU),
+  };
+  tiled_vs_linear[0].layout      = FS_LAYOUT_TILED;
+  tiled_vs_linear[0].layout_mask = FS_LAYOUT_BIT(FS_LAYOUT_TILED);
+  CHECK(fs_dmabuf_reconcile(tiled_vs_linear, 2u, &rec, &zc_ok) == FS_OK);
+  CHECK(zc_ok == 0);
+  CHECK(rec.zero_copy_compatible == 0);
+  CHECK(std::strstr(rec.conflict_reason, "layout_mismatch") != nullptr);
+
+  /* 6c: Incompatible coherency (strict coherent vs non-coherent) */
+  fs_buf_attr_t coh_conflict[2] = {
+      fs_buf_attr_default(FS_DEV_CPU_SME2),
+      fs_buf_attr_default(FS_DEV_TPU),
+  };
+  coh_conflict[0].coherency      = FS_COHERENCY_COHERENT;
+  coh_conflict[0].coherency_mask = FS_COHERENCY_BIT(FS_COHERENCY_COHERENT);
+  CHECK(fs_dmabuf_reconcile(coh_conflict, 2u, &rec, &zc_ok) == FS_OK);
+  CHECK(zc_ok == 0);
+  CHECK(rec.zero_copy_compatible == 0);
+  CHECK(std::strstr(rec.conflict_reason, "coherency_mismatch") != nullptr);
+
+  /* 6d: Router upfront pricing for tiled PBE GPU output vs linear TPU */
+  fs_config_t cfg = fs_config_default();
+  cfg.mock_mode   = 1;
+  cfg.profile     = FS_PROFILE_PIXEL10_LAGUNA;
+
+  fs_context_t* ctx = nullptr;
+  CHECK(fs_context_create(&cfg, &ctx) == FS_OK);
+
+  /* Allocate 1 tiled PBE GPU buffer and 1 reconciled zero-copy GPU+TPU buffer */
+  fs_buf_attr_t gpu_tiled_only = fs_buf_attr_default(FS_DEV_GPU_VK);
+  gpu_tiled_only.layout        = FS_LAYOUT_TILED;
+  gpu_tiled_only.layout_mask   = FS_LAYOUT_BIT(FS_LAYOUT_TILED);
+
+  fs_dmabuf_t *b_tiled = nullptr, *b_linear = nullptr, *b_w = nullptr, *b_out = nullptr;
+  CHECK(fs_buffer_alloc_reconciled(ctx, 16u * 32u * sizeof(float), &gpu_tiled_only, 1u,
+                                   FS_DEV_GPU_VK, FS_BUF_ZERO_INIT, &b_tiled, &rec) == FS_OK);
+  CHECK(b_tiled->layout == FS_LAYOUT_TILED);
+  CHECK(b_tiled->zero_copy_compatible == 1);
+
+  CHECK(fs_buffer_alloc_reconciled(ctx, 16u * 32u * sizeof(float), compat, 3u, FS_DEV_GPU_VK,
+                                   FS_BUF_ZERO_INIT, &b_linear, &rec) == FS_OK);
+  CHECK(b_linear->layout == FS_LAYOUT_LINEAR);
+  CHECK(b_linear->min_align == 128u);
+
+  CHECK(fs_buffer_alloc(ctx, 32u * 32u * sizeof(float), FS_DEV_TPU,
+                        FS_BUF_IMMUTABLE_WEIGHT | FS_BUF_ZERO_INIT, &b_w) == FS_OK);
+  CHECK(fs_buffer_alloc(ctx, 16u * 32u * sizeof(float), FS_DEV_GPU_VK, FS_BUF_ZERO_INIT, &b_out) == FS_OK);
+
+  /* Forced TPU on tiled GPU buffer: router flags zero_copy=0 & prices layout-convert copy upfront */
+  fs_op_desc_t forced_tpu;
+  std::memset(&forced_tpu, 0, sizeof(forced_tpu));
+  forced_tpu.type          = FS_OP_GEMM;
+  forced_tpu.m_dim         = 16u;
+  forced_tpu.k_dim         = 32u;
+  forced_tpu.n_dim         = 32u;
+  forced_tpu.act_dtype     = FS_DTYPE_F32;
+  forced_tpu.weight_dtype  = FS_DTYPE_F32;
+  forced_tpu.route_flags   = FS_ROUTE_FORCE_DEVICE;
+  forced_tpu.preferred_dev = FS_DEV_TPU;
+  forced_tpu.input_a       = b_tiled;
+  forced_tpu.input_b       = b_w;
+  forced_tpu.output        = b_out;
+
+  fs_plan_t* p_forced = nullptr;
+  CHECK(fs_plan_create(ctx, &forced_tpu, 1u, &p_forced) == FS_OK);
+  CHECK(p_forced->steps[0].assigned_dev == FS_DEV_TPU);
+  CHECK(p_forced->steps[0].requires_handoff == 1);
+  CHECK(p_forced->steps[0].zero_copy == 0);
+  CHECK(p_forced->planned_fallback_copies == 1u);
+  CHECK(p_forced->steps[0].est_handoff_us > 65.0f);
+  CHECK(std::strcmp(p_forced->steps[0].reason, "layout_convert_copy") == 0);
+  fs_plan_destroy(p_forced);
+
+  /* Auto-routed GEMM (even with NO_CONTINUITY_BONUS) avoids tiled->linear copy by staying on GPU */
+  fs_op_desc_t auto_tiled = forced_tpu;
+  auto_tiled.route_flags   = FS_ROUTE_NO_CONTINUITY_BONUS;
+  auto_tiled.preferred_dev = FS_DEV_NONE;
+
+  fs_plan_t* p_auto_tiled = nullptr;
+  CHECK(fs_plan_create(ctx, &auto_tiled, 1u, &p_auto_tiled) == FS_OK);
+  CHECK(p_auto_tiled->steps[0].assigned_dev == FS_DEV_GPU_VK);
+  CHECK(p_auto_tiled->steps[0].zero_copy == 1);
+  CHECK(p_auto_tiled->planned_fallback_copies == 0u);
+  fs_plan_destroy(p_auto_tiled);
+
+  /* Same op with reconciled linear DMA-BUF moves cleanly to TPU with zero copies */
+  fs_op_desc_t auto_linear = auto_tiled;
+  auto_linear.input_a      = b_linear;
+  fs_plan_t* p_auto_linear = nullptr;
+  CHECK(fs_plan_create(ctx, &auto_linear, 1u, &p_auto_linear) == FS_OK);
+  CHECK(p_auto_linear->steps[0].assigned_dev == FS_DEV_TPU);
+  CHECK(p_auto_linear->steps[0].requires_handoff == 1);
+  CHECK(p_auto_linear->steps[0].zero_copy == 1);
+  CHECK(p_auto_linear->planned_fallback_copies == 0u);
+  fs_plan_destroy(p_auto_linear);
+
+  fs_context_destroy(ctx);
+  return true;
+}
+
 int main() {
   struct {
     const char* name;
@@ -853,6 +979,7 @@ int main() {
       {"heterogeneous_llm_pipeline_and_parity", test_heterogeneous_llm_pipeline_and_parity},
       {"routing_overrides_continuity_and_degradation", test_routing_overrides_continuity_and_degradation},
       {"custom_vtable_and_ggml_seam", test_custom_vtable_and_ggml_seam},
+      {"dmabuf_reconcile_and_router_pricing", test_dmabuf_reconcile_and_router_pricing},
   };
 
   int passed = 0;

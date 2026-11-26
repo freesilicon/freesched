@@ -99,6 +99,31 @@ int main(void) {
   fs_buffer_release(ctx, buf_a);
   fs_buffer_release(ctx, buf_b);
   fs_buffer_release(ctx, buf_c);
+
+  /* Verify C11 NvSciBuf-style upfront buffer reconciliation */
+  fs_buf_attr_t attrs[3];
+  attrs[0] = fs_buf_attr_default(FS_DEV_GPU_VK);
+  attrs[1] = fs_buf_attr_default(FS_DEV_TPU);
+  attrs[2] = fs_buf_attr_default(FS_DEV_CPU_SME2);
+  fs_buf_reconciled_t rec;
+  int                 zc_ok = 0;
+  CHECK(fs_dmabuf_reconcile(attrs, 3u, &rec, &zc_ok) == FS_OK);
+  CHECK(zc_ok == 1);
+  CHECK(rec.zero_copy_compatible == 1);
+  CHECK(rec.min_align == 128u);
+  CHECK(rec.stride_align == 64u);
+  CHECK(rec.layout == FS_LAYOUT_LINEAR);
+  CHECK(rec.coherency == FS_COHERENCY_NON_COHERENT);
+  CHECK(rec.requires_dma_sync == 1);
+
+  fs_dmabuf_t* rec_buf = NULL;
+  CHECK(fs_buffer_alloc_reconciled(ctx, 256u, attrs, 3u, FS_DEV_GPU_VK, FS_BUF_ZERO_INIT,
+                                   &rec_buf, NULL) == FS_OK);
+  CHECK(rec_buf != NULL);
+  CHECK(rec_buf->zero_copy_compatible == 1);
+  CHECK(rec_buf->min_align == 128u);
+  fs_buffer_release(ctx, rec_buf);
+
   fs_context_destroy(ctx);
 
   /* Verify ggml_freesilicon C11 init/free seam */

@@ -46,7 +46,7 @@ Dependencies stay strictly one-way: `freesched` carries zero vendor libraries, z
 - **Token Decode (`M < threshold`)**: Routes `FS_OP_DECODE_GEMV` / `FS_OP_SWIGLU` (Q8_0, Q4_0, FP16, FP32) to `FS_DEV_TPU`.
 - **Attention & Control**: Routes `FS_OP_ATTN_SOFTMAX`, `FS_OP_ROPE`, `FS_OP_RMS_NORM` to `FS_DEV_CPU_SME2` (or `FS_DEV_CPU_NEON`).
 - **Continuity Bonus**: Subtracts `continuity_bonus_us` when an op's input is already resident on a capable device to prevent cross-chip ping-ponging.
-- **Zero-Copy `DMA-BUF` Ownership**: `fs_buffer_handoff()` enforces single-owner invariants, advances `generation` on every transfer to trap use-after-handoff / double-owner races (`FS_ERR_OWNERSHIP`), models `DMA_BUF_IOCTL_SYNC` on Linux (`#ifdef __linux__`), and maintains `fallback_copies == 0` across GPU <-> CPU <-> TPU pipelines.
+- **Zero-Copy `DMA-BUF` Ownership & Upfront Reconciliation**: `fs_dmabuf_reconcile()` intersects alignment, layout (`linear`/`tiled`), and coherency attributes across participating engines *before* allocation or scheduling so `fs_router.cpp` prices layout-convert copies upfront; `fs_buffer_handoff()` enforces single-owner invariants, advances `generation` on every transfer to trap use-after-handoff / double-owner races (`FS_ERR_OWNERSHIP`), models `DMA_BUF_IOCTL_SYNC` on Linux (`#ifdef __linux__`), and maintains `fallback_copies == 0` across GPU <-> CPU <-> TPU pipelines.
 - **Graceful Degradation**: Disabling GPU, TPU, or both degrades cleanly to the remaining online accelerators with 100% numerical parity.
 
 ## 60-Second Laptop Build & Test
