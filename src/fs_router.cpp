@@ -172,6 +172,64 @@ static float fs_estimate_compute_us(const fs_dev_info_t* dev,
   return static_cast<float>(total_us);
 }
 
+static int fs_check_handoff_reconcile(const fs_topology_t* topo,
+                                      const fs_op_desc_t*  op,
+                                      fs_dev_t             prev_owner,
+                                      fs_dev_t             target_dev,
+                                      float*               out_extra_copy_us) {
+  if (out_extra_copy_us) {
+    *out_extra_copy_us = 0.0f;
+  }
+  if (!op || !op->input_a || prev_owner == FS_DEV_NONE || prev_owner == target_dev) {
+    return 1;
+  }
+  if ((op->input_a->flags & FS_BUF_FORCE_HOST_COPY) != 0u ||
+      (topo->global_caps & FS_CAP_DMABUF) == 0u) {
+    const double bw_gbps = topo->devices[target_dev].mem_bw_gbps > 1.0f
+                               ? static_cast<double>(topo->devices[target_dev].mem_bw_gbps)
+                               : 20.0;
+    const double sz      = static_cast<double>(op->input_a->size > 0u ? op->input_a->size : 4096u);
+    if (out_extra_copy_us) {
+      *out_extra_copy_us = static_cast<float>((2.0 * sz / (bw_gbps * 1e9)) * 1e6 + 45.0);
+    }
+    return 0;
+  }
+
+  fs_buf_attr_t pair[2];
+  pair[0]              = fs_buf_attr_default(prev_owner);
+  pair[0].layout       = op->input_a->layout != FS_LAYOUT_ANY ? op->input_a->layout : pair[0].layout;
+  pair[0].layout_mask  = (pair[0].layout != FS_LAYOUT_ANY) ? FS_LAYOUT_BIT(pair[0].layout) : 0u;
+  pair[0].coherency    = op->input_a->coherency != FS_COHERENCY_ANY ? op->input_a->coherency : pair[0].coherency;
+  pair[0].coherency_mask = (pair[0].coherency != FS_COHERENCY_ANY) ? FS_COHERENCY_BIT(pair[0].coherency) : 0u;
+  if (op->input_a->min_align > 0u) {
+    pair[0].min_align = op->input_a->min_align;
+  }
+  if (op->input_a->stride_align > 0u) {
+    pair[0].stride_align = op->input_a->stride_align;
+  }
+
+  pair[1] = fs_buf_attr_default(target_dev);
+  if (op->input_layout_req != FS_LAYOUT_ANY) {
+    pair[1].layout      = op->input_layout_req;
+    pair[1].layout_mask = FS_LAYOUT_BIT(op->input_layout_req);
+  }
+
+  fs_buf_reconciled_t rec;
+  int                 zc_ok = 1;
+  if (fs_dmabuf_reconcile(pair, 2u, &rec, &zc_ok) != FS_OK) {
+    zc_ok = 0;
+  }
+  if (!zc_ok && out_extra_copy_us) {
+    const double bw_gbps = topo->devices[target_dev].mem_bw_gbps > 1.0f
+                               ? static_cast<double>(topo->devices[target_dev].mem_bw_gbps)
+                               : 20.0;
+    const double sz = static_cast<double>(op->input_a->size > 0u ? op->input_a->size : 4096u);
+    /* Upfront layout-convert + bounce-copy cost (e.g. tiled PBE -> linear TPU) */
+    *out_extra_copy_us = static_cast<float>((2.0 * sz / (bw_gbps * 1e9)) * 1e6 + 65.0);
+  }
+  return zc_ok;
+}
+
 extern "C" {
 
 fs_status_t fs_plan_create(fs_context_t*       ctx,
@@ -225,6 +283,7 @@ fs_status_t fs_plan_create(fs_context_t*       ctx,
     float          best_comp = 0.0f;
     float          best_ho   = 0.0f;
     float          best_mj   = 0.0f;
+    int            best_zc   = 1;
     const char*    reason    = "cost_model";
 
     /* 1. Explicit device override */
@@ -237,11 +296,15 @@ fs_status_t fs_plan_create(fs_context_t*       ctx,
         return FS_ERR_NO_BACKEND;
       }
       chosen = op.preferred_dev;
-      const fs_dev_info_t& di = ctx->topo.devices[chosen];
-      best_comp               = fs_estimate_compute_us(&di, &op, flops, bytes);
-      best_ho = (prev_owner != FS_DEV_NONE && prev_owner != chosen) ? di.handoff_overhead_us : 0.0f;
-      best_mj = (best_comp * 1e-6f) * di.typical_watts * 1000.0f;
-      reason  = "forced_override";
+      const fs_dev_info_t& di       = ctx->topo.devices[chosen];
+      float                extra_us = 0.0f;
+      best_zc   = fs_check_handoff_reconcile(&ctx->topo, &op, prev_owner, chosen, &extra_us);
+      best_comp = fs_estimate_compute_us(&di, &op, flops, bytes);
+      best_ho   = (prev_owner != FS_DEV_NONE && prev_owner != chosen)
+                      ? (di.handoff_overhead_us + extra_us)
+                      : 0.0f;
+      best_mj   = (best_comp * 1e-6f) * di.typical_watts * 1000.0f;
+      reason    = best_zc ? "forced_override" : "layout_convert_copy";
     } else {
       /* 2. Evaluate all online backends supporting this op */
       for (int d = FS_DEV_TPU; d < FS_DEV_COUNT; ++d) {
@@ -257,11 +320,15 @@ fs_status_t fs_plan_create(fs_context_t*       ctx,
         const float comp_us = fs_estimate_compute_us(&di, &op, flops, bytes);
         const int   needs_ho =
             (prev_owner != FS_DEV_NONE && prev_owner != dev) ? 1 : 0;
-        const float ho_us = needs_ho ? di.handoff_overhead_us : 0.0f;
+        float       extra_copy_us = 0.0f;
+        const int   zc_ok =
+            needs_ho ? fs_check_handoff_reconcile(&ctx->topo, &op, prev_owner, dev, &extra_copy_us)
+                     : 1;
+        const float ho_us     = needs_ho ? (di.handoff_overhead_us + extra_copy_us) : 0.0f;
         const float energy_mj = (comp_us * 1e-6f) * di.typical_watts * 1000.0f;
 
-        /* Score combines latency, optional low-power weighting, phase affinity, and continuity */
-        float score = comp_us + ho_us;
+        /* Score combines compute + base handoff + energy, phase bias, then undiscounted copy cost */
+        float score = comp_us + (needs_ho ? di.handoff_overhead_us : 0.0f);
         if ((op.route_flags & FS_ROUTE_PREFER_LOW_POWER) != 0u) {
           score += energy_mj * 120.0f;
         } else {
@@ -272,6 +339,9 @@ fs_status_t fs_plan_create(fs_context_t*       ctx,
         if (dev == ideal_dev) {
           score *= 0.72f;
         }
+
+        /* Layout-convert / host bounce copy penalty is never discounted by phase affinity */
+        score += extra_copy_us;
 
         /* Zero-copy continuity bonus prevents ping-ponging across accelerators */
         const int allow_continuity =
@@ -294,6 +364,7 @@ fs_status_t fs_plan_create(fs_context_t*       ctx,
           best_comp = comp_us;
           best_ho   = ho_us;
           best_mj   = energy_mj;
+          best_zc   = zc_ok;
         }
       }
 
@@ -303,7 +374,9 @@ fs_status_t fs_plan_create(fs_context_t*       ctx,
         return FS_ERR_NO_BACKEND;
       }
 
-      if (chosen != ideal_dev && !ctx->topo.devices[ideal_dev].available) {
+      if (!best_zc) {
+        reason = "layout_convert_copy";
+      } else if (chosen != ideal_dev && !ctx->topo.devices[ideal_dev].available) {
         step.degraded = 1;
         plan->degraded_ops++;
         reason = "degraded_fallback";
@@ -326,10 +399,7 @@ fs_status_t fs_plan_create(fs_context_t*       ctx,
     }
 
     const int req_handoff = (prev_owner != FS_DEV_NONE && prev_owner != chosen) ? 1 : 0;
-    const int force_copy =
-        (op.input_a && (op.input_a->flags & FS_BUF_FORCE_HOST_COPY) != 0u) ||
-        ((ctx->topo.global_caps & FS_CAP_DMABUF) == 0u);
-    const int zero_copy = req_handoff ? (force_copy ? 0 : 1) : 1;
+    const int zero_copy   = req_handoff ? best_zc : 1;
 
     step.assigned_dev     = chosen;
     step.requires_handoff = req_handoff;

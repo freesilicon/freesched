@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -180,7 +181,226 @@ void fs_dmabuf_destroy_all(fs_context_t* ctx) {
   ctx->live_buffers.clear();
 }
 
+static size_t fs_gcd(size_t a, size_t b) {
+  while (b != 0u) {
+    const size_t t = a % b;
+    a              = b;
+    b              = t;
+  }
+  return a;
+}
+
+static int fs_lcm_checked(size_t a, size_t b, size_t* out) {
+  if (a == 0u) a = 1u;
+  if (b == 0u) b = 1u;
+  const size_t g = fs_gcd(a, b);
+  const size_t q = a / g;
+  if (b > (static_cast<size_t>(-1) / q)) {
+    return 0;
+  }
+  *out = q * b;
+  return 1;
+}
+
+static uint32_t fs_effective_layout_mask(const fs_buf_attr_t* attr) {
+  if (attr->layout_mask != 0u) {
+    return attr->layout_mask & (FS_LAYOUT_BIT(FS_LAYOUT_LINEAR) | FS_LAYOUT_BIT(FS_LAYOUT_TILED));
+  }
+  if (attr->layout == FS_LAYOUT_LINEAR) {
+    return FS_LAYOUT_BIT(FS_LAYOUT_LINEAR);
+  }
+  if (attr->layout == FS_LAYOUT_TILED) {
+    return FS_LAYOUT_BIT(FS_LAYOUT_TILED);
+  }
+  return FS_LAYOUT_BIT(FS_LAYOUT_LINEAR) | FS_LAYOUT_BIT(FS_LAYOUT_TILED);
+}
+
+static uint32_t fs_effective_coherency_mask(const fs_buf_attr_t* attr) {
+  if (attr->coherency_mask != 0u) {
+    return attr->coherency_mask &
+           (FS_COHERENCY_BIT(FS_COHERENCY_COHERENT) | FS_COHERENCY_BIT(FS_COHERENCY_NON_COHERENT));
+  }
+  if (attr->coherency == FS_COHERENCY_COHERENT) {
+    return FS_COHERENCY_BIT(FS_COHERENCY_COHERENT);
+  }
+  if (attr->coherency == FS_COHERENCY_NON_COHERENT) {
+    return FS_COHERENCY_BIT(FS_COHERENCY_NON_COHERENT);
+  }
+  return FS_COHERENCY_BIT(FS_COHERENCY_COHERENT) | FS_COHERENCY_BIT(FS_COHERENCY_NON_COHERENT);
+}
+
 extern "C" {
+
+fs_buf_attr_t fs_buf_attr_default(fs_dev_t dev) {
+  fs_buf_attr_t a;
+  std::memset(&a, 0, sizeof(a));
+  a.dev    = dev;
+  a.access = FS_ACCESS_READ_WRITE;
+  switch (dev) {
+    case FS_DEV_TPU:
+      /* Tensor G5/G6 EdgeTPU requires 128B-aligned pitch-linear non-coherent DMA-BUF */
+      a.min_align      = 128u;
+      a.stride_align   = 64u;
+      a.layout         = FS_LAYOUT_LINEAR;
+      a.coherency      = FS_COHERENCY_NON_COHERENT;
+      a.layout_mask    = FS_LAYOUT_BIT(FS_LAYOUT_LINEAR);
+      a.coherency_mask = FS_COHERENCY_BIT(FS_COHERENCY_NON_COHERENT);
+      break;
+    case FS_DEV_GPU_VK:
+      /* PowerVR Volcanic Vulkan supports both linear and tiled PBE, non-coherent DMA-BUF */
+      a.min_align      = 64u;
+      a.stride_align   = 64u;
+      a.layout         = FS_LAYOUT_ANY;
+      a.coherency      = FS_COHERENCY_NON_COHERENT;
+      a.layout_mask    = FS_LAYOUT_BIT(FS_LAYOUT_LINEAR) | FS_LAYOUT_BIT(FS_LAYOUT_TILED);
+      a.coherency_mask = FS_COHERENCY_BIT(FS_COHERENCY_NON_COHERENT);
+      break;
+    case FS_DEV_CPU_NEON:
+    case FS_DEV_CPU_SME2:
+    default:
+      /* ARMv9 CPU expects pitch-linear and handles coherent or explicit DMA_BUF_IOCTL_SYNC */
+      a.min_align      = 64u;
+      a.stride_align   = 16u;
+      a.layout         = FS_LAYOUT_LINEAR;
+      a.coherency      = FS_COHERENCY_ANY;
+      a.layout_mask    = FS_LAYOUT_BIT(FS_LAYOUT_LINEAR);
+      a.coherency_mask = FS_COHERENCY_BIT(FS_COHERENCY_COHERENT) |
+                         FS_COHERENCY_BIT(FS_COHERENCY_NON_COHERENT);
+      break;
+  }
+  return a;
+}
+
+fs_status_t fs_dmabuf_reconcile(const fs_buf_attr_t* attrs,
+                                uint32_t             count,
+                                fs_buf_reconciled_t* out_reconciled,
+                                int*                 out_zero_copy_compatible) {
+  if (!attrs || count == 0u || !out_reconciled) {
+    return FS_ERR_INVALID_ARG;
+  }
+
+  std::memset(out_reconciled, 0, sizeof(*out_reconciled));
+
+  size_t   min_align       = 1u;
+  size_t   stride_align    = 1u;
+  uint32_t layout_inter    = FS_LAYOUT_BIT(FS_LAYOUT_LINEAR) | FS_LAYOUT_BIT(FS_LAYOUT_TILED);
+  uint32_t coherency_inter = FS_COHERENCY_BIT(FS_COHERENCY_COHERENT) |
+                             FS_COHERENCY_BIT(FS_COHERENCY_NON_COHERENT);
+  uint32_t combined_access = 0u;
+  uint32_t dev_mask        = 0u;
+
+  for (uint32_t i = 0; i < count; ++i) {
+    const fs_buf_attr_t& a = attrs[i];
+    if (a.dev != FS_DEV_NONE && !fs_dev_is_valid(a.dev)) {
+      return FS_ERR_INVALID_ARG;
+    }
+    if (!fs_lcm_checked(min_align, a.min_align > 0u ? a.min_align : 1u, &min_align)) {
+      return FS_ERR_OVERFLOW;
+    }
+    if (!fs_lcm_checked(stride_align, a.stride_align > 0u ? a.stride_align : 1u, &stride_align)) {
+      return FS_ERR_OVERFLOW;
+    }
+    layout_inter    &= fs_effective_layout_mask(&a);
+    coherency_inter &= fs_effective_coherency_mask(&a);
+    combined_access |= a.access;
+    if (fs_dev_is_valid(a.dev)) {
+      dev_mask |= (1u << static_cast<uint32_t>(a.dev));
+    }
+  }
+
+  out_reconciled->min_align            = min_align;
+  out_reconciled->stride_align         = stride_align;
+  out_reconciled->combined_access      = combined_access;
+  out_reconciled->participant_dev_mask = dev_mask;
+
+  if (layout_inter == 0u) {
+    out_reconciled->layout               = FS_LAYOUT_ANY;
+    out_reconciled->coherency            = FS_COHERENCY_NON_COHERENT;
+    out_reconciled->requires_dma_sync    = 1;
+    out_reconciled->zero_copy_compatible = 0;
+    std::snprintf(out_reconciled->conflict_reason, sizeof(out_reconciled->conflict_reason),
+                  "layout_mismatch (tiled vs linear)");
+    if (out_zero_copy_compatible) {
+      *out_zero_copy_compatible = 0;
+    }
+    return FS_OK;
+  }
+
+  if (coherency_inter == 0u) {
+    out_reconciled->layout =
+        ((layout_inter & FS_LAYOUT_BIT(FS_LAYOUT_LINEAR)) != 0u) ? FS_LAYOUT_LINEAR : FS_LAYOUT_TILED;
+    out_reconciled->coherency            = FS_COHERENCY_ANY;
+    out_reconciled->requires_dma_sync    = 1;
+    out_reconciled->zero_copy_compatible = 0;
+    std::snprintf(out_reconciled->conflict_reason, sizeof(out_reconciled->conflict_reason),
+                  "coherency_mismatch (coherent vs non_coherent)");
+    if (out_zero_copy_compatible) {
+      *out_zero_copy_compatible = 0;
+    }
+    return FS_OK;
+  }
+
+  /* Prefer pitch-linear when both linear & tiled are in the valid intersection */
+  out_reconciled->layout =
+      ((layout_inter & FS_LAYOUT_BIT(FS_LAYOUT_LINEAR)) != 0u) ? FS_LAYOUT_LINEAR : FS_LAYOUT_TILED;
+
+  /* Prefer non-coherent DMA-BUF with explicit DMA_BUF_IOCTL_SYNC when permitted */
+  if ((coherency_inter & FS_COHERENCY_BIT(FS_COHERENCY_NON_COHERENT)) != 0u) {
+    out_reconciled->coherency         = FS_COHERENCY_NON_COHERENT;
+    out_reconciled->requires_dma_sync = 1;
+  } else {
+    out_reconciled->coherency         = FS_COHERENCY_COHERENT;
+    out_reconciled->requires_dma_sync = 0;
+  }
+
+  out_reconciled->zero_copy_compatible = 1;
+  out_reconciled->conflict_reason[0]   = '\0';
+  if (out_zero_copy_compatible) {
+    *out_zero_copy_compatible = 1;
+  }
+  return FS_OK;
+}
+
+fs_status_t fs_buffer_alloc_reconciled(fs_context_t*        ctx,
+                                       size_t               size_bytes,
+                                       const fs_buf_attr_t* attrs,
+                                       uint32_t             attr_count,
+                                       fs_dev_t             initial_owner,
+                                       uint32_t             flags,
+                                       fs_dmabuf_t**        out_buf,
+                                       fs_buf_reconciled_t* out_reconciled) {
+  if (!ctx || size_bytes == 0u || !attrs || attr_count == 0u || !out_buf) {
+    return FS_ERR_INVALID_ARG;
+  }
+  fs_buf_reconciled_t rec;
+  int                 zc_ok = 0;
+  fs_status_t         st    = fs_dmabuf_reconcile(attrs, attr_count, &rec, &zc_ok);
+  if (st != FS_OK) {
+    return st;
+  }
+
+  const size_t   aligned_bytes = fs_align_up(size_bytes, rec.min_align > 0u ? rec.min_align : 1u);
+  const uint32_t eff_flags =
+      zc_ok ? flags : (flags | static_cast<uint32_t>(FS_BUF_FORCE_HOST_COPY));
+  fs_dmabuf_t* buf = nullptr;
+  st               = fs_buffer_alloc(ctx, aligned_bytes, initial_owner, eff_flags, &buf);
+  if (st != FS_OK) {
+    return st;
+  }
+
+  buf->size                 = size_bytes;
+  buf->layout               = zc_ok ? rec.layout : attrs[0].layout;
+  buf->coherency            = zc_ok ? rec.coherency : attrs[0].coherency;
+  buf->min_align            = rec.min_align;
+  buf->stride_align         = rec.stride_align;
+  buf->zero_copy_compatible = zc_ok;
+
+  if (out_reconciled) {
+    *out_reconciled = rec;
+  }
+  *out_buf = buf;
+  return FS_OK;
+}
 
 fs_fence_t fs_fence_init(fs_dev_t producer_dev) {
   fs_fence_t f;
@@ -271,8 +491,13 @@ fs_status_t fs_buffer_alloc(fs_context_t* ctx,
         rec->pub.sync_file_fd    = -1;
         rec->pub.flags           = flags;
         rec->pub.refcount        = 1u;
-        rec->pub.generation      = 1u;
-        rec->pub.last_handoff_us = fs_now_us();
+        rec->pub.generation           = 1u;
+        rec->pub.last_handoff_us      = fs_now_us();
+        rec->pub.layout               = FS_LAYOUT_LINEAR;
+        rec->pub.coherency            = FS_COHERENCY_NON_COHERENT;
+        rec->pub.min_align            = 64u;
+        rec->pub.stride_align         = 64u;
+        rec->pub.zero_copy_compatible = ((flags & FS_BUF_FORCE_HOST_COPY) == 0u) ? 1 : 0;
 
         if ((flags & FS_BUF_ZERO_INIT) != 0u && rec->pub.host_ptr) {
           std::memset(rec->pub.host_ptr, 0, size_bytes);
@@ -344,8 +569,13 @@ fs_status_t fs_buffer_alloc(fs_context_t* ctx,
   rec->pub.generation      = 1u;
   rec->pub.tpu_iova        = 0u;
   rec->pub.vk_device_addr  = 0u;
-  rec->pub.host_ptr        = host_ptr;
-  rec->pub.last_handoff_us = fs_now_us();
+  rec->pub.host_ptr             = host_ptr;
+  rec->pub.last_handoff_us      = fs_now_us();
+  rec->pub.layout               = FS_LAYOUT_LINEAR;
+  rec->pub.coherency            = FS_COHERENCY_NON_COHERENT;
+  rec->pub.min_align            = 64u;
+  rec->pub.stride_align         = 64u;
+  rec->pub.zero_copy_compatible = ((flags & FS_BUF_FORCE_HOST_COPY) == 0u) ? 1 : 0;
 
   ctx->live_buffers.push_back(rec);
   *out_buf = &rec->pub;
@@ -394,8 +624,13 @@ fs_status_t fs_buffer_import_dmabuf(fs_context_t* ctx,
   rec->pub.flags           = flags | FS_BUF_NO_POOL;
   rec->pub.refcount        = 1u;
   rec->pub.generation      = 1u;
-  rec->pub.host_ptr        = host_ptr;
-  rec->pub.last_handoff_us = fs_now_us();
+  rec->pub.host_ptr             = host_ptr;
+  rec->pub.last_handoff_us      = fs_now_us();
+  rec->pub.layout               = FS_LAYOUT_LINEAR;
+  rec->pub.coherency            = FS_COHERENCY_NON_COHERENT;
+  rec->pub.min_align            = 64u;
+  rec->pub.stride_align         = 64u;
+  rec->pub.zero_copy_compatible = ((flags & FS_BUF_FORCE_HOST_COPY) == 0u) ? 1 : 0;
 
   ctx->live_buffers.push_back(rec);
   *out_buf = &rec->pub;

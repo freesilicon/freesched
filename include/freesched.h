@@ -178,6 +178,52 @@ enum fs_buf_flags {
   FS_BUF_FORCE_HOST_COPY  = (1u << 3)  /* Diagnostic flag to test fallback copy path */
 };
 
+/* NvSciBuf-style upfront buffer attribute reconciliation primitives */
+typedef enum fs_buf_layout {
+  FS_LAYOUT_ANY    = 0, /* Engine accepts linear or tiled */
+  FS_LAYOUT_LINEAR = 1, /* Pitch-linear row-major */
+  FS_LAYOUT_TILED  = 2  /* Hardware-tiled (e.g. PowerVR PBE twiddled/FBCDC) */
+} fs_buf_layout_t;
+
+typedef enum fs_buf_coherency {
+  FS_COHERENCY_ANY          = 0,
+  FS_COHERENCY_COHERENT     = 1, /* Hardware cache-coherent */
+  FS_COHERENCY_NON_COHERENT = 2  /* Explicit DMA_BUF_IOCTL_SYNC required */
+} fs_buf_coherency_t;
+
+enum fs_buf_access_flags {
+  FS_ACCESS_NONE       = 0u,
+  FS_ACCESS_READ       = (1u << 0),
+  FS_ACCESS_WRITE      = (1u << 1),
+  FS_ACCESS_READ_WRITE = (FS_ACCESS_READ | FS_ACCESS_WRITE)
+};
+
+#define FS_LAYOUT_BIT(layout_enum)       (1u << (uint32_t)(layout_enum))
+#define FS_COHERENCY_BIT(coherency_enum) (1u << (uint32_t)(coherency_enum))
+
+typedef struct fs_buf_attr {
+  fs_dev_t           dev;
+  size_t             min_align;      /* Minimum base alignment in bytes (0 -> 1) */
+  size_t             stride_align;   /* Row stride alignment in bytes (0 -> 1) */
+  fs_buf_layout_t    layout;         /* Preferred/required layout (or FS_LAYOUT_ANY) */
+  fs_buf_coherency_t coherency;      /* Preferred/required coherency (or FS_COHERENCY_ANY) */
+  uint32_t           access;         /* Bitmask of enum fs_buf_access_flags */
+  uint32_t           layout_mask;    /* Optional bitmask of FS_LAYOUT_BIT(...) accepted */
+  uint32_t           coherency_mask; /* Optional bitmask of FS_COHERENCY_BIT(...) accepted */
+} fs_buf_attr_t;
+
+typedef struct fs_buf_reconciled {
+  size_t             min_align;            /* Reconciled LCM base alignment in bytes */
+  size_t             stride_align;         /* Reconciled LCM row stride alignment in bytes */
+  fs_buf_layout_t    layout;               /* Reconciled layout (FS_LAYOUT_ANY on conflict) */
+  fs_buf_coherency_t coherency;            /* Reconciled coherency mode */
+  uint32_t           combined_access;      /* Union of participant access flags */
+  uint32_t           participant_dev_mask; /* Bitmask of (1u << dev) participants */
+  int                requires_dma_sync;    /* 1 if explicit DMA_BUF_IOCTL_SYNC is needed */
+  int                zero_copy_compatible; /* 1 if valid zero-copy intersection exists */
+  char               conflict_reason[FS_MAX_NAME_LEN];
+} fs_buf_reconciled_t;
+
 typedef enum fs_fence_state {
   FS_FENCE_UNSIGNALED = 0,
   FS_FENCE_SIGNALED   = 1,
@@ -209,9 +255,14 @@ typedef struct fs_dmabuf {
   uint32_t refcount;        /* Current reference count */
   uint64_t generation;      /* Bumped on every fs_buffer_handoff (stale-handle guard) */
   uint64_t tpu_iova;        /* Mapped EdgeTPU 36-bit IOVA (0 if unmapped) */
-  uint64_t vk_device_addr;  /* Imported Vulkan device address (0 if unmapped) */
-  void*    host_ptr;        /* Host mmap pointer for CPU/mock access */
-  uint64_t last_handoff_us; /* Timestamp of last ownership transfer */
+  uint64_t           vk_device_addr;       /* Imported Vulkan device address (0 if unmapped) */
+  void*              host_ptr;             /* Host mmap pointer for CPU/mock access */
+  uint64_t           last_handoff_us;      /* Timestamp of last ownership transfer */
+  fs_buf_layout_t    layout;               /* Reconciled buffer layout (linear/tiled) */
+  fs_buf_coherency_t coherency;            /* Reconciled coherency mode */
+  size_t             min_align;            /* Reconciled base alignment in bytes */
+  size_t             stride_align;         /* Reconciled row stride alignment in bytes */
+  int                zero_copy_compatible; /* 1 if reconciled for zero-copy sharing */
 } fs_dmabuf_t;
 
 /* =========================================================================
@@ -264,9 +315,11 @@ typedef struct fs_op_desc {
   fs_dmabuf_t*    input_c;      /* Optional: W_up (SwiGLU) or residual/weight */
   fs_dmabuf_t*    input_d;      /* Optional: W_down (SwiGLU) */
   fs_dmabuf_t*    output;       /* Destination buffer */
-  float           aux_param;    /* RMSNorm eps, softmax scale, RoPE base, etc. */
-  uint32_t        pos_offset;   /* Token position offset (RoPE) */
-  const char*     label;        /* Optional human-readable op label */
+  float           aux_param;        /* RMSNorm eps, softmax scale, RoPE base, etc. */
+  uint32_t        pos_offset;       /* Token position offset (RoPE) */
+  const char*     label;            /* Optional human-readable op label */
+  fs_buf_layout_t input_layout_req; /* Optional layout required on input_a (0 -> dev default) */
+  fs_buf_layout_t output_layout;    /* Optional layout emitted on output (0 -> linear) */
 } fs_op_desc_t;
 
 typedef struct fs_plan_step {
@@ -393,8 +446,33 @@ fs_status_t            fs_context_register_backend(fs_context_t*           ctx,
                                                    const fs_backend_ops_t* ops);
 
 /* =========================================================================
- * Zero-Copy DMA-BUF Buffer Pool & Ownership Handoff API
+ * Zero-Copy DMA-BUF Buffer Pool, Reconciliation & Ownership Handoff API
  * ========================================================================= */
+
+fs_buf_attr_t fs_buf_attr_default(fs_dev_t dev);
+
+/*
+ * NvSciBuf-style upfront multi-engine buffer attribute reconciliation.
+ *
+ * Computes the intersection of layout/coherency constraints and LCM alignment
+ * across `count` participating engines before allocation or scheduling.
+ * Returns FS_OK even on incompatibility, setting `*out_zero_copy_compatible = 0`
+ * and populating `out_reconciled->conflict_reason` so routers can price
+ * layout-conversion / copy costs upfront.
+ */
+fs_status_t fs_dmabuf_reconcile(const fs_buf_attr_t* attrs,
+                                uint32_t             count,
+                                fs_buf_reconciled_t* out_reconciled,
+                                int*                 out_zero_copy_compatible);
+
+fs_status_t fs_buffer_alloc_reconciled(fs_context_t*        ctx,
+                                       size_t               size_bytes,
+                                       const fs_buf_attr_t* attrs,
+                                       uint32_t             attr_count,
+                                       fs_dev_t             initial_owner,
+                                       uint32_t             flags,
+                                       fs_dmabuf_t**        out_buf,
+                                       fs_buf_reconciled_t* out_reconciled);
 
 fs_status_t fs_buffer_alloc(fs_context_t* ctx,
                             size_t        size_bytes,
