@@ -71,6 +71,7 @@ SCHED_PROFILES: Dict[str, Dict[str, Any]] = {
         "cpu_watts": 2.6,
         "cpu_launch_us": 3.0,
         "mem_bw_gbps": 48.0,
+        "eff_bw_ratio": 0.56,
         "handoff_us": 8.0,
     },
     "malibu": {
@@ -89,6 +90,7 @@ SCHED_PROFILES: Dict[str, Dict[str, Any]] = {
         "cpu_watts": 2.2,
         "cpu_launch_us": 3.5,
         "mem_bw_gbps": 68.0,
+        "eff_bw_ratio": 0.60,
         "handoff_us": 6.0,
     },
     "host-mock": {
@@ -107,6 +109,7 @@ SCHED_PROFILES: Dict[str, Dict[str, Any]] = {
         "cpu_watts": 2.2,
         "cpu_launch_us": 3.5,
         "mem_bw_gbps": 68.0,
+        "eff_bw_ratio": 0.60,
         "handoff_us": 6.0,
     },
 }
@@ -152,13 +155,26 @@ def validate_verdict(verdict: Any) -> List[str]:
     if verdict.get("pass") is False and (not isinstance(fr, str) or not fr):
         errors.append("failing verdict must provide non-empty fault_reason")
 
-    for num_key in ("nmse", "max_abs_err", "est_hw_us"):
+    for num_key in (
+        "nmse",
+        "max_abs_err",
+        "est_hw_us",
+        "sol_floor_us",
+        "twin_pred_us",
+        "measured_hw_us",
+        "twin_error_pct",
+    ):
         if num_key in verdict and verdict[num_key] is not None:
             v = verdict[num_key]
             if not isinstance(v, (int, float)) or isinstance(v, bool) or float(v) < 0.0:
                 errors.append(f"{num_key} must be non-negative number or null")
 
-    for int_key in ("sram_bytes", "sram_limit_bytes"):
+    if "pct_sol" in verdict and verdict["pct_sol"] is not None:
+        ps = verdict["pct_sol"]
+        if not isinstance(ps, (int, float)) or isinstance(ps, bool) or not (0.0 <= float(ps) <= 1.0):
+            errors.append(f"pct_sol must be in [0.0, 1.0] or null: {ps!r}")
+
+    for int_key in ("sram_bytes", "sram_limit_bytes", "bytes_moved", "flops"):
         if int_key in verdict and verdict[int_key] is not None:
             v = verdict[int_key]
             if not isinstance(v, int) or isinstance(v, bool) or v < 0:
@@ -304,50 +320,113 @@ def _eval_freesched_item(item: Dict[str, Any]) -> Dict[str, Any]:
     require_zero_copy = bool(item.get("require_zero_copy", True))
     nmse = float(item.get("nmse", 0.0))
     max_abs_err = float(item.get("max_abs_err", 0.0))
+    measured_hw_raw = item.get("measured_hw_us")
+    measured_hw_us: Optional[float] = float(measured_hw_raw) if measured_hw_raw is not None else None
+    is_swiglu_b1 = workload.startswith("swiglu-b1") or ("chained_in_sram" in item)
 
     threshold = int(item.get("prefill_m_threshold", prof["prefill_m_threshold"]))
     sram_limit = int(prof["sram_limit_bytes"])
-    # Working-set SRAM footprint estimate for active decode tile + SwiGLU scratch
-    sram_bytes = int(item.get("sram_bytes", (m_decode * (k_dim + h_dim + n_dim) * 4) + (h_dim * k_dim)))
+    bw_bps = float(prof["mem_bw_gbps"]) * 1e9
+    eff_bw_bps = bw_bps * float(prof["eff_bw_ratio"])
 
-    # Routing decisions matching src/fs_router.cpp
-    if m_prefill >= threshold and gpu_online:
-        prefill_dev = "GPU_VK"
-    elif tpu_online:
-        prefill_dev = "TPU"
+    if is_swiglu_b1:
+        chained_in_sram = bool(item.get("chained_in_sram", True))
+        num_chunks = max(1, int(item.get("num_chunks", 1)))
+        m_val = max(1, m_decode)
+        flops_int = int(2 * m_val * (2 * k_dim * h_dim + h_dim * n_dim) + 4 * m_val * h_dim)
+        weight_bytes = (2 * h_dim * k_dim) + (n_dim * h_dim)
+        bias_bytes = (2 * h_dim + n_dim) * 4
+        io_bytes = m_val * (k_dim + n_dim)
+        inter_dram_bytes = 0 if chained_in_sram else (6 * m_val * h_dim)
+        bytes_moved_int = int(weight_bytes + bias_bytes + io_bytes + inter_dram_bytes)
+        sram_bytes = int(
+            item.get(
+                "sram_bytes",
+                (m_val * (k_dim + h_dim + n_dim) * 4) + ((h_dim // num_chunks) * k_dim // 4),
+            )
+        )
+
+        prefill_dev = "TPU" if tpu_online else ("CPU_SME2" if prof["sme2"] else "CPU_NEON")
+        attn_dev = prefill_dev
+        decode_dev = prefill_dev
+        handoffs = 0
+
+        peak_ops = (prof["tpu_tops"] * 1e12) if tpu_online else (prof["cpu_gflops"] * 1e9)
+        compute_sol_us = (flops_int / peak_ops) * 1e6
+        mem_sol_us = (bytes_moved_int / bw_bps) * 1e6
+        sol_floor_us = max(compute_sol_us, mem_sol_us)
+
+        num_launches = num_chunks if chained_in_sram else (3 * num_chunks)
+        sync_gap_us = 0.0 if chained_in_sram else (2.0 * num_chunks * 11.0)
+        launch_us = prof["tpu_launch_us"] if tpu_online else prof["cpu_launch_us"]
+        twin_pred_us = num_launches * launch_us + sync_gap_us + max((bytes_moved_int / eff_bw_bps) * 1e6, compute_sol_us)
+        est_hw_us = twin_pred_us
     else:
-        prefill_dev = "CPU_SME2" if prof["sme2"] else "CPU_NEON"
+        # Working-set SRAM footprint estimate for active decode tile + SwiGLU scratch
+        sram_bytes = int(item.get("sram_bytes", (m_decode * (k_dim + h_dim + n_dim) * 4) + (h_dim * k_dim)))
 
-    attn_dev = "CPU_SME2" if prof["sme2"] else "CPU_NEON"
+        # Routing decisions matching src/fs_router.cpp
+        if m_prefill >= threshold and gpu_online:
+            prefill_dev = "GPU_VK"
+        elif tpu_online:
+            prefill_dev = "TPU"
+        else:
+            prefill_dev = "CPU_SME2" if prof["sme2"] else "CPU_NEON"
 
-    if tpu_online:
-        decode_dev = "TPU"
-    elif gpu_online and m_decode >= threshold:
-        decode_dev = "GPU_VK"
-    else:
-        decode_dev = "CPU_SME2" if prof["sme2"] else "CPU_NEON"
+        attn_dev = "CPU_SME2" if prof["sme2"] else "CPU_NEON"
 
-    # Estimate roofline hardware latency
-    prefill_flops = 2.0 * max(m_prefill, 1) * k_dim * n_dim
-    decode_flops = 2.0 * max(m_decode, 1) * (k_dim * n_dim + 2.0 * k_dim * h_dim + h_dim * n_dim)
-    gpu_peak = prof["gpu_gflops"] * 1e9
-    tpu_peak = prof["tpu_tops"] * 1e12
-    cpu_peak = prof["cpu_gflops"] * 1e9
+        if tpu_online:
+            decode_dev = "TPU"
+        elif gpu_online and m_decode >= threshold:
+            decode_dev = "GPU_VK"
+        else:
+            decode_dev = "CPU_SME2" if prof["sme2"] else "CPU_NEON"
 
-    def _stage_us(dev: str, flops: float) -> float:
-        if dev == "GPU_VK":
-            return (flops / gpu_peak) * 1e6 + prof["gpu_launch_us"]
-        if dev == "TPU":
-            return (flops / tpu_peak) * 1e6 + prof["tpu_launch_us"]
-        return (flops / cpu_peak) * 1e6 + prof["cpu_launch_us"]
+        # Roofline flops & DRAM traffic across prefill + attention + decode
+        prefill_flops = 2.0 * max(m_prefill, 1) * k_dim * n_dim
+        attn_flops = 6.0 * max(m_prefill, 1) * n_dim
+        decode_flops = 2.0 * max(m_decode, 1) * (k_dim * n_dim + 2.0 * k_dim * h_dim + h_dim * n_dim)
+        flops_int = int(prefill_flops + attn_flops + decode_flops)
 
-    handoffs = (1 if prefill_dev != attn_dev else 0) + (1 if attn_dev != decode_dev else 0)
-    est_hw_us = (
-        _stage_us(prefill_dev, prefill_flops)
-        + _stage_us(attn_dev, 6.0 * max(m_prefill, 1) * n_dim)
-        + _stage_us(decode_dev, decode_flops)
-        + handoffs * prof["handoff_us"]
-    )
+        prefill_bytes = (max(m_prefill, 1) * (k_dim + n_dim) + n_dim * k_dim) * 4
+        attn_bytes = 2 * max(m_prefill, 1) * n_dim * 4
+        decode_bytes = (max(m_decode, 1) * (k_dim + n_dim) * 4) + (n_dim * k_dim + 2 * h_dim * k_dim + n_dim * h_dim)
+        bytes_moved_int = int(prefill_bytes + attn_bytes + decode_bytes)
+
+        gpu_peak = prof["gpu_gflops"] * 1e9
+        tpu_peak = prof["tpu_tops"] * 1e12
+        cpu_peak = prof["cpu_gflops"] * 1e9
+
+        def _stage_us(dev: str, stage_flops: float, stage_bytes: float) -> float:
+            if dev == "GPU_VK":
+                return max((stage_flops / gpu_peak) * 1e6, (stage_bytes / eff_bw_bps) * 1e6) + prof["gpu_launch_us"]
+            if dev == "TPU":
+                return max((stage_flops / tpu_peak) * 1e6, (stage_bytes / eff_bw_bps) * 1e6) + prof["tpu_launch_us"]
+            return max((stage_flops / cpu_peak) * 1e6, (stage_bytes / eff_bw_bps) * 1e6) + prof["cpu_launch_us"]
+
+        def _stage_sol_us(dev: str, stage_flops: float, stage_bytes: float) -> float:
+            peak = gpu_peak if dev == "GPU_VK" else (tpu_peak if dev == "TPU" else cpu_peak)
+            return max((stage_flops / peak) * 1e6, (stage_bytes / bw_bps) * 1e6)
+
+        handoffs = (1 if prefill_dev != attn_dev else 0) + (1 if attn_dev != decode_dev else 0)
+        sol_floor_us = (
+            _stage_sol_us(prefill_dev, prefill_flops, prefill_bytes)
+            + _stage_sol_us(attn_dev, attn_flops, attn_bytes)
+            + _stage_sol_us(decode_dev, decode_flops, decode_bytes)
+        )
+        twin_pred_us = (
+            _stage_us(prefill_dev, prefill_flops, prefill_bytes)
+            + _stage_us(attn_dev, attn_flops, attn_bytes)
+            + _stage_us(decode_dev, decode_flops, decode_bytes)
+            + handoffs * prof["handoff_us"]
+        )
+        est_hw_us = twin_pred_us
+
+    effective_us = measured_hw_us if (measured_hw_us is not None and measured_hw_us > 0.0) else twin_pred_us
+    pct_sol = min(1.0, max(0.0, sol_floor_us / effective_us)) if effective_us > 0.0 else 0.0
+    twin_error_pct: Optional[float] = None
+    if measured_hw_us is not None and measured_hw_us > 0.0:
+        twin_error_pct = abs(twin_pred_us - measured_hw_us) / measured_hw_us
 
     diagnostics: List[Dict[str, Any]] = []
     fault_reason: Optional[str] = None
@@ -449,6 +528,13 @@ def _eval_freesched_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "sram_bytes": sram_bytes,
         "sram_limit_bytes": sram_limit,
         "est_hw_us": round(est_hw_us, 3),
+        "bytes_moved": bytes_moved_int,
+        "flops": flops_int,
+        "sol_floor_us": round(sol_floor_us, 3),
+        "twin_pred_us": round(twin_pred_us, 3),
+        "measured_hw_us": round(measured_hw_us, 3) if measured_hw_us is not None else None,
+        "pct_sol": round(pct_sol, 6),
+        "twin_error_pct": round(twin_error_pct, 6) if twin_error_pct is not None else None,
         "eval_ms": eval_ms,
         "fault_reason": fault_reason,
         "diagnostics": diagnostics,
@@ -765,6 +851,92 @@ def eval_mixed_batch(
     return final, schema_errors
 
 
+def verify_sol_receipt(receipt_path: Path) -> Dict[str, Any]:
+    """Re-evaluate a Speed-of-Light calibration receipt and verify SOL floor, A/B gain, and silicon parity."""
+    doc = json.loads(receipt_path.read_text(encoding="utf-8"))
+    verdict_a = _eval_freesched_item(doc["schedule_a_baseline"]["candidate"])
+    verdict_b = _eval_freesched_item(doc["schedule_b_chained"]["candidate"])
+    errors: List[str] = []
+
+    for label, v in (("schedule_a_baseline", verdict_a), ("schedule_b_chained", verdict_b)):
+        errs = validate_verdict(v)
+        if errs:
+            errors.extend(f"{label}: {e}" for e in errs)
+        if not v["pass"]:
+            errors.append(f"{label}: expected pass=True")
+
+    exp_a = doc["schedule_a_baseline"].get("expected", {})
+    exp_b = doc["schedule_b_chained"].get("expected", {})
+    if "max_twin_error_pct" in exp_a and verdict_a["twin_error_pct"] is not None:
+        if verdict_a["twin_error_pct"] > exp_a["max_twin_error_pct"]:
+            errors.append(f"schedule_a twin_error_pct {verdict_a['twin_error_pct']} > {exp_a['max_twin_error_pct']}")
+    if "max_twin_error_pct" in exp_b and verdict_b["twin_error_pct"] is not None:
+        if verdict_b["twin_error_pct"] > exp_b["max_twin_error_pct"]:
+            errors.append(f"schedule_b twin_error_pct {verdict_b['twin_error_pct']} > {exp_b['max_twin_error_pct']}")
+    if "min_pct_sol" in exp_b and verdict_b["pct_sol"] < exp_b["min_pct_sol"]:
+        errors.append(f"schedule_b pct_sol {verdict_b['pct_sol']} < {exp_b['min_pct_sol']}")
+
+    if not (verdict_b["twin_pred_us"] < verdict_a["twin_pred_us"] and verdict_b["pct_sol"] > verdict_a["pct_sol"]):
+        errors.append("1-change A/B schedule_b did not improve latency and pct_sol over schedule_a")
+
+    cross_results: List[Dict[str, Any]] = []
+    for item in doc.get("cross_shape_validation", []):
+        cv = _eval_freesched_item(item["candidate"])
+        cerrs = validate_verdict(cv)
+        if cerrs:
+            errors.extend(f"{item['name']}: {e}" for e in cerrs)
+        cexp = item.get("expected", {})
+        if "max_twin_error_pct" in cexp and cv["twin_error_pct"] is not None:
+            if cv["twin_error_pct"] > cexp["max_twin_error_pct"]:
+                errors.append(f"{item['name']} twin_error_pct {cv['twin_error_pct']} > {cexp['max_twin_error_pct']}")
+        if "min_pct_sol" in cexp and cv["pct_sol"] < cexp["min_pct_sol"]:
+            errors.append(f"{item['name']} pct_sol {cv['pct_sol']} < {cexp['min_pct_sol']}")
+        cross_results.append(
+            {
+                "name": item["name"],
+                "sol_floor_us": cv["sol_floor_us"],
+                "twin_pred_us": cv["twin_pred_us"],
+                "measured_hw_us": cv["measured_hw_us"],
+                "pct_sol": cv["pct_sol"],
+                "twin_error_pct": cv["twin_error_pct"],
+            }
+        )
+
+    return {
+        "receipt": receipt_path.name,
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "schedule_a": {
+            "workload": verdict_a["workload"],
+            "bytes_moved": verdict_a["bytes_moved"],
+            "flops": verdict_a["flops"],
+            "sol_floor_us": verdict_a["sol_floor_us"],
+            "twin_pred_us": verdict_a["twin_pred_us"],
+            "measured_hw_us": verdict_a["measured_hw_us"],
+            "pct_sol": verdict_a["pct_sol"],
+            "twin_error_pct": verdict_a["twin_error_pct"],
+            "reward": verdict_a["reward"],
+        },
+        "schedule_b": {
+            "workload": verdict_b["workload"],
+            "bytes_moved": verdict_b["bytes_moved"],
+            "flops": verdict_b["flops"],
+            "sol_floor_us": verdict_b["sol_floor_us"],
+            "twin_pred_us": verdict_b["twin_pred_us"],
+            "measured_hw_us": verdict_b["measured_hw_us"],
+            "pct_sol": verdict_b["pct_sol"],
+            "twin_error_pct": verdict_b["twin_error_pct"],
+            "reward": verdict_b["reward"],
+        },
+        "ab_delta": {
+            "twin_speedup": round(verdict_a["twin_pred_us"] / verdict_b["twin_pred_us"], 3),
+            "pct_sol_gain": round(verdict_b["pct_sol"] - verdict_a["pct_sol"], 4),
+            "bytes_saved": verdict_a["bytes_moved"] - verdict_b["bytes_moved"],
+        },
+        "cross_shape_validation": cross_results,
+    }
+
+
 def cmd_self_test(
     freepvr_dir: Optional[Path],
     freetile_bin: Optional[Path],
@@ -866,6 +1038,12 @@ def cmd_self_test(
             assert nv["pass"] is True
             native_verdicts.append(nv)
 
+    sol_receipt_path = TWIN_DIR / "receipts" / "tensor-g5-swiglu-b1.json"
+    sol_receipt_res: Optional[Dict[str, Any]] = None
+    if sol_receipt_path.is_file():
+        sol_receipt_res = verify_sol_receipt(sol_receipt_path)
+        assert sol_receipt_res["valid"], f"SOL calibration receipt failed: {sol_receipt_res['errors']}"
+
     pass_count = sum(1 for v in verdicts if v["pass"])
     fail_count = sum(1 for v in verdicts if not v["pass"])
     assert fail_count == expected_fails, f"expected {expected_fails} intentional fails, got {fail_count}"
@@ -881,6 +1059,7 @@ def cmd_self_test(
             "freepvr_twin": freepvr_dir is not None,
             "freetile_twin": freetile_bin is not None,
         },
+        "sol_receipt_verified": sol_receipt_res is not None and sol_receipt_res["valid"],
         "freecs_self_test": freecs_status,
         "freeusc_self_test": freeusc_status,
         "mesa_fma32_pass": mesa_fma32_pass,
@@ -1019,6 +1198,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "  dgc0 <file.dgc0> [args...]                 Validate a raw .dgc0 wire payload via freetile-twin\n"
             "  eval [--spec FILE | --jsonl] [--pretty]    Evaluate mixed GPU+TPU+Scheduler candidates\n"
             "  validate-verdict <FILE | ->                Validate JSON/JSONL verdict(s) against REWARD-SCHEMA.json\n"
+            "  verify-receipt [FILE]                      Verify Speed-of-Light silicon calibration receipt\n"
             "  self-test                                  Run offline verification across all available engines\n"
             "  bench [--freesched N] [--freecs N] [--freeusc N] [--freetile N]\n"
             "                                             Run combined throughput benchmark (>= 1,000 evals/min)\n"
@@ -1132,6 +1312,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 bad.append({"index": idx, "errors": errs})
         print(json.dumps({"valid": len(bad) == 0, "checked": len(records), "failures": bad}, indent=2))
         return 0 if not bad else 1
+
+    if cmd == "verify-receipt":
+        rpath = Path(rest[0]) if rest else (TWIN_DIR / "receipts" / "tensor-g5-swiglu-b1.json")
+        res = verify_sol_receipt(rpath)
+        print(json.dumps(res, indent=2))
+        return 0 if res["valid"] else 1
 
     if cmd == "self-test":
         return cmd_self_test(freepvr_dir=freepvr_dir, freetile_bin=freetile_bin, bench_bin=bench_bin)

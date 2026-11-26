@@ -24,6 +24,9 @@ EOF
 
 # Combined throughput benchmark (>= 1,000 evals/min gate)
 ./twin/freesilicon-twin bench
+
+# Verify Speed-of-Light (SOL) calibration receipt (Tensor G5 Batch-1 SwiGLU A/B)
+./twin/freesilicon-twin verify-receipt twin/receipts/tensor-g5-swiglu-b1.json
 ```
 
 ## Plugging In Sibling Hardware Twins

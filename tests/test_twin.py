@@ -32,6 +32,16 @@ class TestFreeSiliconTwin(unittest.TestCase):
             self.assertIn(req, doc["required"])
         domains = set(doc["properties"]["domain"]["enum"])
         self.assertTrue({"freecs", "freeusc", "freetile", "dgc0", "freesched"}.issubset(domains))
+        for sol_field in (
+            "bytes_moved",
+            "flops",
+            "sol_floor_us",
+            "twin_pred_us",
+            "measured_hw_us",
+            "pct_sol",
+            "twin_error_pct",
+        ):
+            self.assertIn(sol_field, doc["properties"])
 
     def test_unified_self_test(self) -> None:
         proc = subprocess.run(
@@ -195,6 +205,51 @@ class TestFreeSiliconTwin(unittest.TestCase):
         self.assertTrue(verdict["checks"]["native_binary_verified"])
         self.assertEqual(verdict["checks"]["fallback_copies"], 0)
         self.assertGreater(verdict["checks"]["zero_copy_handoffs"], 0)
+
+    def test_sol_calibration_receipt_swiglu_b1(self) -> None:
+        receipt = TWIN_DIR / "receipts" / "tensor-g5-swiglu-b1.json"
+        self.assertTrue(receipt.is_file())
+        proc = subprocess.run(
+            [sys.executable, str(CLI), "verify-receipt", str(receipt)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        res = json.loads(proc.stdout.decode("utf-8"))
+        self.assertTrue(res["valid"], f"receipt errors: {res['errors']}")
+        a = res["schedule_a"]
+        b = res["schedule_b"]
+        self.assertEqual(b["flops"], 5314560)
+        self.assertEqual(b["bytes_moved"], 2669952)
+        self.assertAlmostEqual(b["sol_floor_us"], 55.624, places=2)
+        self.assertEqual(b["measured_hw_us"], 114.0)
+        self.assertGreater(b["pct_sol"], a["pct_sol"])
+        self.assertLess(b["twin_pred_us"], a["twin_pred_us"])
+        self.assertLess(b["twin_error_pct"], 0.05)
+        self.assertGreater(res["ab_delta"]["twin_speedup"], 1.4)
+        self.assertEqual(len(res["cross_shape_validation"]), 1)
+        self.assertLess(res["cross_shape_validation"][0]["twin_error_pct"], 0.05)
+
+    def test_sol_schema_rejects_out_of_range_pct_sol(self) -> None:
+        bad = {
+            "schema_version": "freesilicon.twin.v1",
+            "domain": "freesched",
+            "target": "laguna",
+            "workload": "bad-sol",
+            "pass": True,
+            "reward": 0.9,
+            "fault_reason": None,
+            "eval_ms": 0.01,
+            "pct_sol": 1.25,
+            "checks": {},
+        }
+        proc = subprocess.run(
+            [sys.executable, str(CLI), "validate-verdict", "-"],
+            input=json.dumps(bad).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(proc.returncode, 0)
 
     def test_bench_throughput_gate(self) -> None:
         proc = subprocess.run(
