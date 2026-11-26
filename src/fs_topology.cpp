@@ -66,7 +66,7 @@ static void fs_copy_str(char* dst, size_t dst_size, const char* src) {
 }
 
 static void fs_fill_profile_laguna(fs_topology_t* topo, int is_mock) {
-  const uint32_t mock_bit = is_mock ? FS_CAP_MOCK : 0u;
+  const uint32_t mock_bit = is_mock ? static_cast<uint32_t>(FS_CAP_MOCK) : 0u;
   const uint32_t base_mem = FS_CAP_UNIFIED_MEMORY | FS_CAP_DMABUF | FS_CAP_SYNC_FILE | mock_bit;
 
   topo->profile             = FS_PROFILE_PIXEL10_LAGUNA;
@@ -140,7 +140,7 @@ static void fs_fill_profile_laguna(fs_topology_t* topo, int is_mock) {
 }
 
 static void fs_fill_profile_malibu(fs_topology_t* topo, int is_mock) {
-  const uint32_t mock_bit = is_mock ? FS_CAP_MOCK : 0u;
+  const uint32_t mock_bit = is_mock ? static_cast<uint32_t>(FS_CAP_MOCK) : 0u;
   const uint32_t base_mem = FS_CAP_UNIFIED_MEMORY | FS_CAP_DMABUF | FS_CAP_SYNC_FILE | mock_bit;
 
   topo->profile             = FS_PROFILE_PIXEL11_MALIBU;
