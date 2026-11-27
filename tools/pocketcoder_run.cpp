@@ -18,13 +18,26 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+struct pc_run_options {
+  bool        inspect         = false;
+  bool        bench           = false;
+  bool        bench_synthetic = false;
+  const char* gguf_path       = nullptr;
+  uint32_t    iters           = 200u;
+  int         mock_mode       = 1;
+  int         strict_hw       = 0;
+  const char* dive_interp     = nullptr;
+  uint8_t     perf_mode       = 5u;
+};
+
 void print_usage(const char* argv0) {
-  std::fprintf(stderr,
-               "Usage:\n"
-               "  %s --inspect <model.gguf>\n"
-               "  %s --bench <model.gguf> [--iters N]\n"
-               "  %s --bench-synthetic [--iters N]\n",
-               argv0, argv0, argv0);
+  std::fprintf(
+      stderr,
+      "Usage:\n"
+      "  %s --inspect <model.gguf>\n"
+      "  %s --bench <model.gguf> [--iters N] [--live|--mock] [--strict-hw] [--dive-interp PATH] [--perf-mode 0..5]\n"
+      "  %s --bench-synthetic [--iters N] [--live|--mock] [--strict-hw] [--dive-interp PATH] [--perf-mode 0..5]\n",
+      argv0, argv0, argv0);
 }
 
 void build_synthetic_q4_0(uint32_t n_dim, uint32_t k_dim, std::vector<uint8_t>* out) {
@@ -143,7 +156,9 @@ int run_inspect(const char* path) {
   return 0;
 }
 
-int run_bench(const char* gguf_path, uint32_t iters) {
+int run_bench(const pc_run_options& opts) {
+  const char*          gguf_path = opts.bench ? opts.gguf_path : nullptr;
+  const uint32_t       iters     = opts.iters;
   pc_inkling2_config_t cfg{};
   pc_soa_matrix_t      mat{};
   std::vector<uint8_t> synth_q4;
@@ -251,29 +266,108 @@ int run_bench(const char* gguf_path, uint32_t iters) {
   pc_graph_config_t gcfg = pc_graph_config_default();
   gcfg.hidden_dim        = k_dim;
   gcfg.expert_ffn_dim    = n_dim;
-  pc_graph_t* graph      = nullptr;
-  pc_graph_stats_t gstats{};
+  gcfg.mock_mode         = opts.mock_mode;
+  gcfg.dive_interp_path  = opts.dive_interp;
+  gcfg.require_tpu_hw    = opts.strict_hw;
+  gcfg.perf_mode         = opts.perf_mode;
+
+  pc_graph_t*      graph = nullptr;
+  pc_graph_stats_t gstats_first{};
+  pc_graph_stats_t gstats_end{};
   std::vector<uint8_t> dmabuf_w_q4;
-  build_synthetic_q4_0(n_dim, k_dim, &dmabuf_w_q4);
+  const void* graph_w_ptr = nullptr;
+  if (raw_type == PC_GGML_TYPE_Q4_0 && raw_ptr != nullptr) {
+    graph_w_ptr = raw_ptr;
+  } else {
+    build_synthetic_q4_0(n_dim, k_dim, &dmabuf_w_q4);
+    graph_w_ptr = dmabuf_w_q4.data();
+  }
   std::vector<float> rms_w(k_dim, 1.0f);
   std::vector<float> y_graph(n_dim, 0.0f);
-  if (pc_graph_create(&gcfg, &graph) == FS_OK) {
-    pc_graph_run_prebaked_step(graph, x.data(), dmabuf_w_q4.data(), rms_w.data(), y_graph.data(), &gstats);
-    pc_graph_destroy(graph);
+  std::vector<float> x_step(x);
+
+  fs_status_t grc = pc_graph_create(&gcfg, &graph);
+  if (grc != FS_OK) {
+    std::fprintf(stderr, "pc_graph_create failed (mock_mode=%d, strict_hw=%d): %s\n",
+                 gcfg.mock_mode, gcfg.require_tpu_hw, fs_status_string(grc));
+    pc_soa_free(&mat);
+    if (gf) pc_gguf_close(gf);
+    return 1;
   }
 
-  std::printf("PocketCoder-13B-A3B Micro-Benchmark [%s, %ux%u, backend=%s, iters=%u]\n",
-              src_label, n_dim, k_dim, pc_soa_kernel_backend_name(), iters);
+  fs_status_t brc = pc_graph_bind_weights(graph, graph_w_ptr, rms_w.data());
+  if (brc == FS_OK) {
+    brc = pc_graph_step_bound(graph, x.data(), y_graph.data(), &gstats_first);
+  }
+  if (brc != FS_OK) {
+    std::fprintf(stderr, "pc_graph bind/first step failed: %s\n", fs_status_string(brc));
+    pc_graph_destroy(graph);
+    pc_soa_free(&mat);
+    if (gf) pc_gguf_close(gf);
+    return 1;
+  }
+
+  const uint32_t bound_steps = std::max<uint32_t>(2u, std::min<uint32_t>(iters, 16u));
+  for (uint32_t s = 0; s < bound_steps; ++s) {
+    const float scale = 1.0f + 0.005f * static_cast<float>(s + 1u);
+    for (uint32_t j = 0; j < k_dim; ++j) {
+      x_step[j] = x[j] * scale;
+    }
+    pc_graph_stats_t* dst_stats = (s + 1u == bound_steps) ? &gstats_end : nullptr;
+    brc = pc_graph_step_bound(graph, x_step.data(), y_graph.data(), dst_stats);
+    if (brc != FS_OK) {
+      std::fprintf(stderr, "pc_graph_step_bound failed at step %u: %s\n", s, fs_status_string(brc));
+      pc_graph_destroy(graph);
+      pc_soa_free(&mat);
+      if (gf) pc_gguf_close(gf);
+      return 1;
+    }
+  }
+  const double graph_bound_us = run_timed_median_us(
+      std::min<uint32_t>(iters, 20u),
+      [&]() { (void)pc_graph_step_bound(graph, x.data(), y_graph.data(), nullptr); }, &sink);
+  (void)pc_graph_step_bound(graph, x_step.data(), y_graph.data(), &gstats_end);
+  pc_graph_destroy(graph);
+
+  const uint64_t delta_misses = (gstats_end.ob_w_misses >= gstats_first.ob_w_misses)
+                                    ? (gstats_end.ob_w_misses - gstats_first.ob_w_misses)
+                                    : 0u;
+  const uint64_t delta_evict = (gstats_end.ob_w_evictions >= gstats_first.ob_w_evictions)
+                                   ? (gstats_end.ob_w_evictions - gstats_first.ob_w_evictions)
+                                   : 0u;
+  const uint64_t delta_pack_us = (gstats_end.ob_weight_pack_us >= gstats_first.ob_weight_pack_us)
+                                     ? (gstats_end.ob_weight_pack_us - gstats_first.ob_weight_pack_us)
+                                     : 0u;
+
+  std::printf("PocketCoder-13B-A3B Micro-Benchmark [%s, %ux%u, backend=%s, iters=%u, mode=%s]\n",
+              src_label, n_dim, k_dim, pc_soa_kernel_backend_name(), iters,
+              opts.mock_mode ? "mock" : (gstats_end.ob_hw_active ? "live-hw" : "live-fallback"));
   std::printf("Parity vs FP32 ref: SoA-F32 max_abs=%.3e nmse=%.3e | SoA-SDOT max_abs=%.3e nmse=%.3e\n",
               p_f32.max_abs_err, p_f32.nmse, p_sdot.max_abs_err, p_sdot.nmse);
   std::printf("DSpark (MAX_DUP=4): %u -> %u unique experts (%.2fx dedup, %.2f MB saved/layer)\n",
               dplan.naive_expert_loads, dplan.dedup_expert_loads, dplan.dedup_ratio,
               static_cast<double>(dplan.bytes_saved) / (1024.0 * 1024.0));
-  std::printf("DMA-BUF graph: zero_copy=%d min_align=%zu handoffs=%llu fallback_copies=%llu nmse=%.3e\n\n",
-              gstats.reconciled_zero_copy, gstats.reconciled_min_align,
-              static_cast<unsigned long long>(gstats.zero_copy_handoffs),
-              static_cast<unsigned long long>(gstats.fallback_copies),
-              gstats.nmse);
+  std::printf(
+      "DMA-BUF graph: zero_copy=%d min_align=%zu handoffs=%llu fallback_copies=%llu "
+      "hw_active=%d emitter=%d freetile=%d ob_calls=%llu ob_tiles=%llu ob_hw_us=%llu "
+      "w_hits=%llu w_misses=%llu(delta=%llu) w_evict=%llu(delta=%llu) pack_us=%llu(delta=%llu) "
+      "w_bytes=%llu nmse=%.3e\n\n",
+      gstats_end.reconciled_zero_copy, gstats_end.reconciled_min_align,
+      static_cast<unsigned long long>(gstats_end.zero_copy_handoffs),
+      static_cast<unsigned long long>(gstats_end.fallback_copies),
+      gstats_end.ob_hw_active, gstats_end.ob_emitter_active, gstats_end.ob_freetile_active,
+      static_cast<unsigned long long>(gstats_end.ob_calls),
+      static_cast<unsigned long long>(gstats_end.ob_tiles_dispatched),
+      static_cast<unsigned long long>(gstats_end.ob_hw_us),
+      static_cast<unsigned long long>(gstats_end.ob_w_hits),
+      static_cast<unsigned long long>(gstats_end.ob_w_misses),
+      static_cast<unsigned long long>(delta_misses),
+      static_cast<unsigned long long>(gstats_end.ob_w_evictions),
+      static_cast<unsigned long long>(delta_evict),
+      static_cast<unsigned long long>(gstats_end.ob_weight_pack_us),
+      static_cast<unsigned long long>(delta_pack_us),
+      static_cast<unsigned long long>(gstats_end.ob_weight_cache_bytes),
+      gstats_end.nmse);
 
   std::printf("| Metric | Baseline (Scalar SoA) | Now (NEON SoA F32) | Now (NEON SoA sdot) | How measured |\n");
   std::printf("|---|---:|---:|---:|---|\n");
@@ -283,12 +377,23 @@ int run_bench(const char* gguf_path, uint32_t iters) {
               neon_sdot_us, ctrl_us / neon_sdot_us, iters);
   std::printf("| Effective Weight BW | %.2f GB/s | %.2f GB/s | %.2f GB/s | (scales+qs+x)/median_us |\n",
               bw_ctrl, bw_f32, bw_sdot);
+  std::printf("| Pre-baked Bound Step %ux%u | - | %.2f us median | hw=%d emitter=%d | pc_graph_step_bound (%u iters) |\n",
+              n_dim, k_dim, graph_bound_us, gstats_end.ob_hw_active, gstats_end.ob_emitter_active,
+              std::min<uint32_t>(iters, 20u));
 
   pc_soa_free(&mat);
   if (gf) {
     pc_gguf_close(gf);
   }
-  return (p_f32.nmse < 1e-10 && p_sdot.nmse < 1e-2 && gstats.fallback_copies == 0u) ? 0 : 1;
+  const double graph_nmse_limit = gstats_end.ob_hw_active ? 5e-3 : 1e-10;
+  const bool   dmabuf_ok        = (gstats_end.fallback_copies == 0u) ||
+                                  (!opts.mock_mode && !opts.strict_hw && gstats_end.ob_hw_active == 0);
+  const bool   zero_repack_ok   = (delta_misses == 0u && delta_evict == 0u && delta_pack_us == 0u);
+  const bool   graph_parity_ok  = (gstats_first.nmse < graph_nmse_limit && gstats_end.nmse < graph_nmse_limit);
+  return (p_f32.nmse < 1e-10 && p_sdot.nmse < 1e-2 && dmabuf_ok &&
+          zero_repack_ok && graph_parity_ok)
+             ? 0
+             : 1;
 }
 
 } /* namespace */
@@ -299,22 +404,47 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  uint32_t iters = 200u;
+  pc_run_options opts{};
   for (int i = 1; i < argc; ++i) {
-    if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
-      iters = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
-      if (iters == 0u) iters = 1u;
+    const char* arg = argv[i];
+    if (std::strcmp(arg, "--inspect") == 0 && i + 1 < argc) {
+      opts.inspect   = true;
+      opts.gguf_path = argv[++i];
+    } else if (std::strcmp(arg, "--bench") == 0 && i + 1 < argc) {
+      opts.bench     = true;
+      opts.gguf_path = argv[++i];
+    } else if (std::strcmp(arg, "--bench-synthetic") == 0) {
+      opts.bench_synthetic = true;
+    } else if (std::strcmp(arg, "--iters") == 0 && i + 1 < argc) {
+      opts.iters = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      if (opts.iters == 0u) opts.iters = 1u;
+    } else if (std::strcmp(arg, "--live") == 0) {
+      opts.mock_mode = 0;
+    } else if (std::strcmp(arg, "--mock") == 0) {
+      opts.mock_mode = 1;
+    } else if (std::strcmp(arg, "--strict-hw") == 0) {
+      opts.mock_mode = 0;
+      opts.strict_hw = 1;
+    } else if (std::strcmp(arg, "--dive-interp") == 0 && i + 1 < argc) {
+      opts.dive_interp = argv[++i];
+    } else if (std::strcmp(arg, "--perf-mode") == 0 && i + 1 < argc) {
+      unsigned long pm = std::strtoul(argv[++i], nullptr, 10);
+      opts.perf_mode   = static_cast<uint8_t>(pm <= 5ul ? pm : 5ul);
+    } else {
+      std::fprintf(stderr, "Unknown or incomplete argument: %s\n", arg);
+      print_usage(argv[0]);
+      return 1;
     }
   }
 
-  if (std::strcmp(argv[1], "--inspect") == 0 && argc >= 3) {
-    return run_inspect(argv[2]);
+  if (opts.inspect && !opts.bench && !opts.bench_synthetic && opts.gguf_path) {
+    return run_inspect(opts.gguf_path);
   }
-  if (std::strcmp(argv[1], "--bench") == 0 && argc >= 3) {
-    return run_bench(argv[2], iters);
+  if (opts.bench && !opts.inspect && !opts.bench_synthetic && opts.gguf_path) {
+    return run_bench(opts);
   }
-  if (std::strcmp(argv[1], "--bench-synthetic") == 0) {
-    return run_bench(nullptr, iters);
+  if (opts.bench_synthetic && !opts.inspect && !opts.bench) {
+    return run_bench(opts);
   }
 
   print_usage(argv[0]);

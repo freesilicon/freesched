@@ -491,6 +491,87 @@ bool test_dspark_dedup_and_dmabuf_graph() {
   CHECK(gstats.nmse < 1e-10);
 
   pc_graph_destroy(graph);
+
+  /* 3. Bound weights + upfront prepack + zero-repack steady-state loop + DIVE emitter wiring */
+  char dive_tmp_path[256];
+  std::snprintf(dive_tmp_path, sizeof(dive_tmp_path), "/tmp/freesched_dive_test_%ld.bin",
+                static_cast<long>(getpid()));
+  {
+    FILE* df = std::fopen(dive_tmp_path, "wb");
+    CHECK(df != nullptr);
+    std::vector<uint8_t> synth_dive(65536u, 0x13u);
+    CHECK(std::fwrite(synth_dive.data(), 1u, synth_dive.size(), df) == synth_dive.size());
+    std::fclose(df);
+  }
+
+  pc_graph_config_t gcfg2 = pc_graph_config_default();
+  gcfg2.hidden_dim        = 128u;
+  gcfg2.expert_ffn_dim    = 64u;
+  gcfg2.dive_interp_path  = dive_tmp_path;
+  pc_graph_t* graph2      = nullptr;
+  CHECK(pc_graph_create(&gcfg2, &graph2) == FS_OK);
+
+  /* Step before binding weights must fail closed */
+  CHECK(pc_graph_step_bound(graph2, gx.data(), gy.data(), nullptr) == FS_ERR_INVALID_ARG);
+
+  CHECK(pc_graph_bind_weights(graph2, gw.data(), grms.data()) == FS_OK);
+
+  pc_graph_stats_t gstats0{};
+  pc_graph_stats_t gstats8{};
+  CHECK(pc_graph_step_bound(graph2, gx.data(), gy.data(), &gstats0) == FS_OK);
+  CHECK(gstats0.fallback_copies == 0u);
+  CHECK(gstats0.nmse < 1e-10);
+
+  std::vector<float> gx_step(128u, 0.0f);
+  for (uint32_t s = 0u; s < 8u; ++s) {
+    for (uint32_t j = 0u; j < 128u; ++j) {
+      gx_step[j] = 0.25f + 0.03f * static_cast<float>((s + j) & 7u);
+    }
+    CHECK(pc_graph_step_bound(graph2, gx_step.data(), gy.data(), (s == 7u) ? &gstats8 : nullptr) ==
+          FS_OK);
+  }
+  CHECK(gstats8.fallback_copies == 0u);
+  CHECK(gstats8.nmse < 1e-10);
+  CHECK(gstats8.ob_w_misses == gstats0.ob_w_misses);
+  CHECK(gstats8.ob_w_evictions == gstats0.ob_w_evictions);
+  CHECK(gstats8.ob_weight_pack_us == gstats0.ob_weight_pack_us);
+  if (gstats8.ob_emitter_active == 1) {
+    CHECK(gstats8.ob_freetile_active == 1);
+    CHECK(gstats8.ob_calls >= 9u);
+    CHECK(gstats8.ob_tiles_dispatched >= 9u);
+    CHECK(gstats8.ob_w_hits > gstats0.ob_w_hits);
+    CHECK(gstats8.ob_weight_cache_bytes > 0u);
+  }
+
+  /* Verify weight re-binding updates generation without stale cache hits */
+  std::vector<uint8_t> gw2 = gw;
+  for (uint32_t r = 0; r < 64u; ++r) {
+    for (uint32_t b = 0; b < 4u; ++b) {
+      uint8_t*       blk = gw2.data() + (r * 4u + b) * 18u;
+      const uint16_t d16 = fs_f32_to_f16(0.11f);
+      std::memcpy(blk, &d16, 2u);
+    }
+  }
+  CHECK(pc_graph_bind_weights(graph2, gw2.data(), grms.data()) == FS_OK);
+  pc_graph_stats_t gstats_rebind{};
+  CHECK(pc_graph_step_bound(graph2, gx.data(), gy.data(), &gstats_rebind) == FS_OK);
+  CHECK(gstats_rebind.nmse < 1e-10);
+
+  pc_graph_destroy(graph2);
+  (void)std::remove(dive_tmp_path);
+
+  /* Strict-HW gate must fail closed when /dev/edgetpu-soc is absent */
+  if (access("/dev/edgetpu-soc", F_OK) != 0) {
+    pc_graph_config_t strict_cfg = pc_graph_config_default();
+    strict_cfg.hidden_dim        = 128u;
+    strict_cfg.expert_ffn_dim    = 64u;
+    strict_cfg.mock_mode         = 0;
+    strict_cfg.require_tpu_hw    = 1;
+    pc_graph_t* strict_g         = nullptr;
+    CHECK(pc_graph_create(&strict_cfg, &strict_g) == FS_ERR_NO_BACKEND);
+    CHECK(strict_g == nullptr);
+  }
+
   std::printf("[PASS] test_dspark_dedup_and_dmabuf_graph\n");
   return true;
 }

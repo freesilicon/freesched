@@ -291,9 +291,9 @@ static fs_hw_profile_t fs_detect_profile_from_env_or_os(int* out_is_mock) {
   return FS_PROFILE_HOST_MOCK;
 }
 
-extern "C" {
-
-fs_status_t fs_topology_probe(fs_hw_profile_t profile_hint, fs_topology_t* out_topo) {
+fs_status_t fs_topology_probe_mode(fs_hw_profile_t profile_hint,
+                                   int             force_mock,
+                                   fs_topology_t*  out_topo) {
   if (!out_topo) {
     return FS_ERR_INVALID_ARG;
   }
@@ -316,6 +316,10 @@ fs_status_t fs_topology_probe(fs_hw_profile_t profile_hint, fs_topology_t* out_t
 #else
     is_mock = (mock_env && std::strcmp(mock_env, "0") != 0) ? 1 : 0;
 #endif
+  }
+
+  if (force_mock > 0) {
+    is_mock = 1;
   }
 
   switch (profile) {
@@ -353,6 +357,12 @@ fs_status_t fs_topology_probe(fs_hw_profile_t profile_hint, fs_topology_t* out_t
 #endif
 
   return FS_OK;
+}
+
+extern "C" {
+
+fs_status_t fs_topology_probe(fs_hw_profile_t profile_hint, fs_topology_t* out_topo) {
+  return fs_topology_probe_mode(profile_hint, -1, out_topo);
 }
 
 fs_status_t fs_topology_set_device_enabled(fs_topology_t* topo, fs_dev_t dev, int enabled) {

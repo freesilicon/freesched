@@ -24,6 +24,7 @@ struct pc_graph {
   fs_op_desc_t        ops[2];
   fs_plan_t*          plan;
   size_t              w_q4_bytes;
+  bool                weights_bound;
 };
 
 extern "C" {
@@ -142,12 +143,15 @@ fs_status_t pc_dspark_execute_moe_f32(const pc_dspark_dedup_plan_t* plan,
 pc_graph_config_t pc_graph_config_default(void) {
   pc_graph_config_t cfg;
   std::memset(&cfg, 0, sizeof(cfg));
-  cfg.struct_size    = static_cast<uint32_t>(sizeof(pc_graph_config_t));
-  cfg.profile        = FS_PROFILE_PIXEL10_LAGUNA;
-  cfg.mock_mode      = 1;
-  cfg.hidden_dim     = 2304u;
-  cfg.expert_ffn_dim = 1152u;
-  cfg.dspark_max_dup = 4u;
+  cfg.struct_size      = static_cast<uint32_t>(sizeof(pc_graph_config_t));
+  cfg.profile          = FS_PROFILE_PIXEL10_LAGUNA;
+  cfg.mock_mode        = 1;
+  cfg.hidden_dim       = 2304u;
+  cfg.expert_ffn_dim   = 1152u;
+  cfg.dspark_max_dup   = 4u;
+  cfg.dive_interp_path = nullptr;
+  cfg.require_tpu_hw   = 0;
+  cfg.perf_mode        = 5u;
   return cfg;
 }
 
@@ -157,7 +161,17 @@ fs_status_t pc_graph_create(const pc_graph_config_t* cfg, pc_graph_t** out_graph
   }
   *out_graph = nullptr;
 
-  pc_graph_config_t eff = cfg ? *cfg : pc_graph_config_default();
+  pc_graph_config_t eff = pc_graph_config_default();
+  if (cfg) {
+    const size_t copy_sz = (cfg->struct_size > 0u && cfg->struct_size < sizeof(eff))
+                               ? static_cast<size_t>(cfg->struct_size)
+                               : sizeof(eff);
+    std::memcpy(&eff, cfg, copy_sz);
+    if (cfg->struct_size == 0u && eff.perf_mode == 0u) {
+      eff.perf_mode = 5u;
+    }
+    eff.struct_size = static_cast<uint32_t>(sizeof(eff));
+  }
   if (eff.hidden_dim == 0u || eff.expert_ffn_dim == 0u ||
       (eff.hidden_dim % PC_GGUF_BLK_SIZE) != 0u) {
     return FS_ERR_INVALID_ARG;
@@ -173,9 +187,12 @@ fs_status_t pc_graph_create(const pc_graph_config_t* cfg, pc_graph_t** out_graph
     return rc;
   }
 
-  /* Wire freesched's optional openbuenos EdgeTPU adapter (mock fallback when HW absent) */
+  /* Wire freesched's optional openbuenos EdgeTPU adapter (DIVE + FreeTile + mock fallback) */
   fs_openbuenos_config_t ob_cfg = fs_openbuenos_config_default();
-  ob_cfg.allow_mock_fallback    = 1;
+  ob_cfg.allow_mock_fallback    = eff.require_tpu_hw ? 0 : 1;
+  ob_cfg.dive_interp_path       = eff.dive_interp_path;
+  ob_cfg.enable_freetile        = 1;
+  ob_cfg.perf_mode              = (eff.perf_mode <= 5u) ? eff.perf_mode : 5u;
   rc = fs_backend_register_openbuenos(ctx, &ob_cfg);
   if (rc != FS_OK) {
     fs_context_destroy(ctx);
@@ -276,13 +293,109 @@ void pc_graph_destroy(pc_graph_t* graph) {
   delete graph;
 }
 
-fs_status_t pc_graph_run_prebaked_step(pc_graph_t*       graph,
+static fs_status_t pc_fill_graph_stats(const pc_graph_t* graph,
                                        const float*      x_in,
-                                       const void*       w_q4_0,
-                                       const float*      rms_weight,
-                                       float*            y_out,
+                                       const float*      y_out,
                                        pc_graph_stats_t* out_stats) {
-  if (!graph || !x_in || !w_q4_0 || !rms_weight || !y_out) {
+  if (!out_stats) {
+    return FS_OK;
+  }
+
+  const uint32_t k_dim = graph->cfg.hidden_dim;
+  const uint32_t n_dim = graph->cfg.expert_ffn_dim;
+
+  std::vector<float> norm_ref(k_dim);
+  const float*       rms_weight = static_cast<const float*>(graph->buf_rms_w->host_ptr);
+  double             ss         = 0.0;
+  for (uint32_t i = 0; i < k_dim; ++i) {
+    ss += static_cast<double>(x_in[i]) * static_cast<double>(x_in[i]);
+  }
+  const float inv = static_cast<float>(1.0 / std::sqrt(ss / static_cast<double>(k_dim) + 1e-6));
+  for (uint32_t i = 0; i < k_dim; ++i) {
+    norm_ref[i] = x_in[i] * inv * rms_weight[i];
+  }
+
+  std::vector<float> y_ref(n_dim);
+  fs_status_t        rc = pc_gemv_ref_raw_f32(graph->buf_w_q4->host_ptr, PC_GGML_TYPE_Q4_0,
+                                              norm_ref.data(), y_ref.data(), n_dim, k_dim);
+  if (rc != FS_OK) {
+    return rc;
+  }
+
+  fs_parity_t parity;
+  fs_compute_parity_f32(y_out, y_ref.data(), n_dim, &parity);
+
+  fs_telemetry_t tel;
+  fs_context_get_telemetry(graph->ctx, &tel);
+
+  fs_openbuenos_profile_t ob_prof;
+  std::memset(&ob_prof, 0, sizeof(ob_prof));
+  (void)fs_backend_openbuenos_get_profile(graph->ctx, &ob_prof);
+
+  std::memset(out_stats, 0, sizeof(*out_stats));
+  out_stats->reconciled_zero_copy    = graph->reconciled.zero_copy_compatible;
+  out_stats->reconciled_min_align    = graph->reconciled.min_align;
+  out_stats->reconciled_stride_align = graph->reconciled.stride_align;
+  out_stats->planned_steps           = graph->plan->num_steps;
+  out_stats->zero_copy_handoffs      = tel.zero_copy_handoffs;
+  out_stats->fallback_copies         = tel.fallback_copies;
+  out_stats->tpu_ops                 = tel.tpu_ops;
+  out_stats->cpu_ops                 = tel.cpu_ops;
+  out_stats->dma_sync_calls          = tel.dma_sync_calls;
+  out_stats->max_abs_err             = parity.max_abs_err;
+  out_stats->nmse                    = parity.nmse;
+  out_stats->ob_hw_active            = ob_prof.hw_active;
+  out_stats->ob_emitter_active       = ob_prof.emitter_active;
+  out_stats->ob_freetile_active      = ob_prof.freetile_active;
+  out_stats->ob_calls                = ob_prof.calls;
+  out_stats->ob_tiles_dispatched     = ob_prof.tiles_dispatched;
+  out_stats->ob_hw_us                = ob_prof.hw_us;
+  out_stats->ob_w_hits               = ob_prof.weight_cache_hits;
+  out_stats->ob_w_misses             = ob_prof.weight_cache_misses;
+  out_stats->ob_w_evictions          = ob_prof.weight_cache_evictions;
+  out_stats->ob_weight_pack_us       = ob_prof.weight_pack_us;
+  out_stats->ob_weight_cache_bytes   = ob_prof.weight_cache_bytes;
+  return FS_OK;
+}
+
+fs_status_t pc_graph_bind_weights(pc_graph_t*  graph,
+                                  const void*  w_q4_0,
+                                  const float* rms_weight) {
+  if (!graph || !w_q4_0 || !rms_weight) {
+    return FS_ERR_INVALID_ARG;
+  }
+
+  const uint32_t k_dim = graph->cfg.hidden_dim;
+  std::memcpy(graph->buf_rms_w->host_ptr, rms_weight, static_cast<size_t>(k_dim) * sizeof(float));
+  std::memcpy(graph->buf_w_q4->host_ptr, w_q4_0, graph->w_q4_bytes);
+  graph->buf_rms_w->generation++;
+  graph->buf_w_q4->generation++;
+
+  fs_status_t rc =
+      fs_buffer_dma_sync(graph->ctx, graph->buf_rms_w, FS_DMA_SYNC_WRITE | FS_DMA_SYNC_END);
+  if (rc != FS_OK) {
+    return rc;
+  }
+  rc = fs_buffer_dma_sync(graph->ctx, graph->buf_w_q4, FS_DMA_SYNC_WRITE | FS_DMA_SYNC_END);
+  if (rc != FS_OK) {
+    return rc;
+  }
+
+  /* Register immutable region + prepack EdgeTPU ext[2] tiles & DIVE graphs upfront */
+  rc = fs_backend_openbuenos_prepack_op(graph->ctx, &graph->ops[1]);
+  if (rc != FS_OK) {
+    return rc;
+  }
+
+  graph->weights_bound = true;
+  return FS_OK;
+}
+
+fs_status_t pc_graph_step_bound(pc_graph_t*       graph,
+                                const float*      x_in,
+                                float*            y_out,
+                                pc_graph_stats_t* out_stats) {
+  if (!graph || !x_in || !y_out || !graph->weights_bound) {
     return FS_ERR_INVALID_ARG;
   }
 
@@ -290,8 +403,12 @@ fs_status_t pc_graph_run_prebaked_step(pc_graph_t*       graph,
   const uint32_t n_dim = graph->cfg.expert_ffn_dim;
 
   std::memcpy(graph->buf_x->host_ptr, x_in, static_cast<size_t>(k_dim) * sizeof(float));
-  std::memcpy(graph->buf_rms_w->host_ptr, rms_weight, static_cast<size_t>(k_dim) * sizeof(float));
-  std::memcpy(graph->buf_w_q4->host_ptr, w_q4_0, graph->w_q4_bytes);
+
+  fs_status_t rc =
+      fs_buffer_dma_sync(graph->ctx, graph->buf_x, FS_DMA_SYNC_WRITE | FS_DMA_SYNC_END);
+  if (rc != FS_OK) {
+    return rc;
+  }
 
   /* Reset buffer owner to CPU_NEON before executing pre-baked plan so step 1 performs zero-copy handoff */
   if (graph->buf_norm->owner_dev != FS_DEV_CPU_NEON) {
@@ -303,50 +420,35 @@ fs_status_t pc_graph_run_prebaked_step(pc_graph_t*       graph,
   }
 
   fs_context_reset_telemetry(graph->ctx);
-  fs_status_t rc = fs_execute_plan(graph->ctx, graph->plan, graph->ops, 2u);
+  rc = fs_execute_plan(graph->ctx, graph->plan, graph->ops, 2u);
   if (rc != FS_OK) {
     return rc;
   }
 
+  rc = fs_buffer_dma_sync(graph->ctx, graph->buf_out, FS_DMA_SYNC_READ | FS_DMA_SYNC_END);
+  if (rc != FS_OK) {
+    return rc;
+  }
   std::memcpy(y_out, graph->buf_out->host_ptr, static_cast<size_t>(n_dim) * sizeof(float));
 
-  if (out_stats) {
-    std::vector<float> norm_ref(k_dim);
-    double ss = 0.0;
-    for (uint32_t i = 0; i < k_dim; ++i) {
-      ss += static_cast<double>(x_in[i]) * static_cast<double>(x_in[i]);
-    }
-    const float inv = static_cast<float>(1.0 / std::sqrt(ss / static_cast<double>(k_dim) + 1e-6));
-    for (uint32_t i = 0; i < k_dim; ++i) {
-      norm_ref[i] = x_in[i] * inv * rms_weight[i];
-    }
-    std::vector<float> y_ref(n_dim);
-    rc = pc_gemv_ref_raw_f32(w_q4_0, PC_GGML_TYPE_Q4_0, norm_ref.data(), y_ref.data(), n_dim, k_dim);
-    if (rc != FS_OK) {
-      return rc;
-    }
+  return pc_fill_graph_stats(graph, x_in, y_out, out_stats);
+}
 
-    fs_parity_t parity;
-    fs_compute_parity_f32(y_out, y_ref.data(), n_dim, &parity);
-
-    fs_telemetry_t tel;
-    fs_context_get_telemetry(graph->ctx, &tel);
-
-    std::memset(out_stats, 0, sizeof(*out_stats));
-    out_stats->reconciled_zero_copy    = graph->reconciled.zero_copy_compatible;
-    out_stats->reconciled_min_align    = graph->reconciled.min_align;
-    out_stats->reconciled_stride_align = graph->reconciled.stride_align;
-    out_stats->planned_steps           = graph->plan->num_steps;
-    out_stats->zero_copy_handoffs      = tel.zero_copy_handoffs;
-    out_stats->fallback_copies         = tel.fallback_copies;
-    out_stats->tpu_ops                 = tel.tpu_ops;
-    out_stats->cpu_ops                 = tel.cpu_ops;
-    out_stats->dma_sync_calls          = tel.dma_sync_calls;
-    out_stats->max_abs_err             = parity.max_abs_err;
-    out_stats->nmse                    = parity.nmse;
+fs_status_t pc_graph_run_prebaked_step(pc_graph_t*       graph,
+                                       const float*      x_in,
+                                       const void*       w_q4_0,
+                                       const float*      rms_weight,
+                                       float*            y_out,
+                                       pc_graph_stats_t* out_stats) {
+  if (!graph || !x_in || !w_q4_0 || !rms_weight || !y_out) {
+    return FS_ERR_INVALID_ARG;
   }
 
-  return FS_OK;
+  fs_status_t rc = pc_graph_bind_weights(graph, w_q4_0, rms_weight);
+  if (rc != FS_OK) {
+    return rc;
+  }
+  return pc_graph_step_bound(graph, x_in, y_out, out_stats);
 }
 
 } /* extern "C" */

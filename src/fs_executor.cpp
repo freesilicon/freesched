@@ -699,7 +699,7 @@ fs_status_t fs_context_create(const fs_config_t* cfg, fs_context_t** out_ctx) {
     hint = FS_PROFILE_HOST_MOCK;
   }
 
-  fs_status_t st = fs_topology_probe(hint, &ctx->topo);
+  fs_status_t st = fs_topology_probe_mode(hint, eff.mock_mode ? 1 : -1, &ctx->topo);
   if (st != FS_OK) {
     delete ctx;
     return st;

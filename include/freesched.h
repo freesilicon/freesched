@@ -445,7 +445,28 @@ typedef struct fs_openbuenos_config {
   int         allow_mock_fallback; /* 1 = run exact host reference if TPU/lib absent */
   uint8_t     perf_mode;           /* 0..5 DVFS tier matching ob_config_t::perf_mode */
   uint8_t     reserved[3];
+  const char* dive_interp_path;    /* NULL -> OPENBUENOS_DIVE_INTERP_PATH / firmware probe */
+  int         enable_freetile;     /* 1 = enable FreeTile BUENOS_A0 VLIW emitter (default 1) */
+  uint32_t    weight_cache_mb;     /* 0 = auto / OPENBUENOS_WEIGHT_CACHE_MB env */
 } fs_openbuenos_config_t;
+
+typedef struct fs_openbuenos_profile {
+  int      hw_active;
+  int      emitter_active;
+  int      freetile_active;
+  uint64_t calls;
+  uint64_t tiles_dispatched;
+  uint64_t hw_us;
+  uint64_t total_wall_us;
+  uint64_t hash_us;
+  uint64_t weight_pack_us;
+  uint64_t weight_cache_hits;
+  uint64_t weight_cache_misses;
+  uint64_t weight_cache_evictions;
+  uint64_t weight_cache_bytes;
+  uint64_t weight_cache_peak_bytes;
+  uint64_t weight_cache_budget_bytes;
+} fs_openbuenos_profile_t;
 
 typedef struct fs_vulkan_dmabuf_config {
   uint32_t    struct_size;           /* Optional: sizeof(fs_vulkan_dmabuf_config_t) or 0 */
@@ -491,6 +512,10 @@ fs_vulkan_dmabuf_config_t fs_vulkan_dmabuf_config_default(void);
 
 fs_status_t fs_backend_register_openbuenos(fs_context_t*                 ctx,
                                            const fs_openbuenos_config_t* cfg);
+fs_status_t fs_backend_openbuenos_prepack_op(fs_context_t*       ctx,
+                                             const fs_op_desc_t* op);
+fs_status_t fs_backend_openbuenos_get_profile(const fs_context_t*      ctx,
+                                              fs_openbuenos_profile_t* out_profile);
 fs_status_t fs_backend_register_vulkan_dmabuf(fs_context_t*                    ctx,
                                               const fs_vulkan_dmabuf_config_t* cfg);
 

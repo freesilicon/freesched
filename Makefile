@@ -13,6 +13,16 @@ ifeq ($(shell uname -s),Linux)
 LDFLAGS  += -ldl
 endif
 
+OPENBUENOS_DIR ?=
+ifneq ($(OPENBUENOS_DIR),)
+OB_LIB := $(firstword $(wildcard $(OPENBUENOS_DIR)/build/host/libopenbuenos.a $(OPENBUENOS_DIR)/build/linux-arm64/libopenbuenos.a $(OPENBUENOS_DIR)/build/libopenbuenos.a))
+ifeq ($(OB_LIB),)
+$(error OPENBUENOS_DIR=$(OPENBUENOS_DIR) specified but libopenbuenos.a not found)
+endif
+CXXFLAGS += -DFREESCHED_HAVE_LIBOPENBUENOS=1 -I$(OPENBUENOS_DIR)/include
+LDFLAGS  := $(OB_LIB) $(LDFLAGS)
+endif
+
 SRCS := \
 	$(THIS_DIR)/src/fs_topology.cpp \
 	$(THIS_DIR)/src/fs_dmabuf.cpp \

@@ -131,10 +131,14 @@ int main(void) {
   fs_fence_close(&sf);
   fs_buffer_release(ctx, rec_buf);
 
-  /* Verify C11 optional backend adapter registration APIs */
+  /* Verify C11 optional backend adapter registration & telemetry APIs */
   fs_openbuenos_config_t ob_cfg = fs_openbuenos_config_default();
+  CHECK(ob_cfg.enable_freetile == 1);
+  CHECK(ob_cfg.perf_mode == 5u);
   fs_vulkan_dmabuf_config_t vk_cfg = fs_vulkan_dmabuf_config_default();
   CHECK(fs_backend_register_openbuenos(ctx, &ob_cfg) == FS_OK);
+  fs_openbuenos_profile_t ob_prof;
+  CHECK(fs_backend_openbuenos_get_profile(ctx, &ob_prof) == FS_OK);
   CHECK(fs_backend_register_vulkan_dmabuf(ctx, &vk_cfg) == FS_OK);
 
   fs_context_destroy(ctx);
@@ -150,6 +154,8 @@ int main(void) {
   pc_graph_config_t pc_cfg = pc_graph_config_default();
   CHECK(pc_cfg.hidden_dim == 2304u);
   CHECK(pc_cfg.expert_ffn_dim == 1152u);
+  CHECK(pc_cfg.perf_mode == 5u);
+  CHECK(pc_cfg.require_tpu_hw == 0);
   CHECK(pc_ggml_type_block_elems(PC_GGML_TYPE_IQ4_XS) == 256u);
   CHECK(pc_ggml_type_block_bytes(PC_GGML_TYPE_IQ4_XS) == 136u);
 
