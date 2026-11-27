@@ -170,6 +170,8 @@ struct fs_ob_api {
   int (*prepack_batch)(void*, uint32_t, uint32_t, const fs_ob_gemm_f32_quant_job*, uint32_t, fs_ob_prepack_stats*);
   int (*matmul_batch)(void*, const float*, uint32_t, uint32_t, const fs_ob_gemm_f32_quant_job*, uint32_t, fs_ob_invoke_stats*);
   int (*swiglu)(void*, const float*, const fs_ob_gemm_swiglu_quant_desc*, float*, fs_ob_invoke_stats*);
+  int (*dmabuf_map)(void*, int, uint64_t, uint64_t, uint32_t, uint64_t*);
+  int (*dmabuf_unmap)(void*, uint64_t);
 };
 
 #ifdef FREESCHED_HAVE_LIBOPENBUENOS
@@ -237,6 +239,18 @@ static int fs_wrap_ob_swiglu(void*                               ctx,
       static_cast<ob_context_t*>(ctx), a_mk,
       reinterpret_cast<const ob_gemm_swiglu_quant_desc_t*>(desc), c_mn,
       reinterpret_cast<ob_invoke_stats_t*>(out)));
+}
+static int fs_wrap_ob_dmabuf_map(void*     ctx,
+                                 int       dmabuf_fd,
+                                 uint64_t  offset,
+                                 uint64_t  size,
+                                 uint32_t  flags,
+                                 uint64_t* out_iova) {
+  return static_cast<int>(
+      ob_dmabuf_map(static_cast<ob_context_t*>(ctx), dmabuf_fd, offset, size, flags, out_iova));
+}
+static int fs_wrap_ob_dmabuf_unmap(void* ctx, uint64_t iova) {
+  return static_cast<int>(ob_dmabuf_unmap(static_cast<ob_context_t*>(ctx), iova));
 }
 #endif /* FREESCHED_HAVE_LIBOPENBUENOS */
 
@@ -317,6 +331,8 @@ static void fs_ob_resolve_api(fs_openbuenos_state* st, int allow_dlopen) {
   st->api.prepack_batch       = fs_wrap_ob_prepack_batch;
   st->api.matmul_batch        = fs_wrap_ob_matmul_batch;
   st->api.swiglu              = fs_wrap_ob_swiglu;
+  st->api.dmabuf_map          = fs_wrap_ob_dmabuf_map;
+  st->api.dmabuf_unmap        = fs_wrap_ob_dmabuf_unmap;
 #elif defined(__linux__)
   void* sym_handle = nullptr;
   if (allow_dlopen) {
@@ -344,6 +360,8 @@ static void fs_ob_resolve_api(fs_openbuenos_state* st, int allow_dlopen) {
   load_sym(st->api.prepack_batch, "ob_gemm_prepack_quant_batch");
   load_sym(st->api.matmul_batch, "ob_gemm_matmul_f32_quant_batch");
   load_sym(st->api.swiglu, "ob_gemm_swiglu_f32_quant");
+  load_sym(st->api.dmabuf_map, "ob_dmabuf_map");
+  load_sym(st->api.dmabuf_unmap, "ob_dmabuf_unmap");
 #else
   (void)st;
   (void)allow_dlopen;
@@ -399,12 +417,6 @@ static fs_status_t fs_openbuenos_init(void* user_data, const fs_topology_t* topo
   const char* dev_path =
       (st->cfg.device_path && st->cfg.device_path[0] != '\0') ? st->cfg.device_path : "/dev/edgetpu-soc";
 
-#ifdef __linux__
-  if (!is_mock_topo) {
-    st->tpu_dev_fd = open(dev_path, O_RDWR | O_CLOEXEC);
-  }
-#endif
-
   fs_ob_resolve_api(st, !is_mock_topo);
 
   const char* dive_path =
@@ -417,15 +429,30 @@ static fs_status_t fs_openbuenos_init(void* user_data, const fs_topology_t* topo
     fs_ob_config ob_cfg;
     std::memset(&ob_cfg, 0, sizeof(ob_cfg));
     ob_cfg.struct_size          = static_cast<uint32_t>(sizeof(fs_ob_config));
-    ob_cfg.mock_mode            = (is_mock_topo || st->tpu_dev_fd < 0) ? 1 : 0;
+    ob_cfg.mock_mode            = is_mock_topo ? 1 : 0;
     ob_cfg.device_path          = dev_path;
     ob_cfg.dma_heap_path        = st->cfg.dma_heap_path;
     ob_cfg.max_inflight         = 16u;
     ob_cfg.graph_cache_capacity = 2048u;
     ob_cfg.perf_mode            = st->cfg.perf_mode;
 
-    if (st->api.ctx_create(&ob_cfg, &st->ob_ctx) == 0 && st->ob_ctx) {
-      st->hw_active = (!ob_cfg.mock_mode && st->tpu_dev_fd >= 0) ? 1 : 0;
+    /*
+     * Let ob_context_create() own the single /dev/edgetpu-soc descriptor with
+     * EDGETPU_CREATE_GROUP / shared PASID instead of opening a duplicate
+     * ungrouped fd in freesched.
+     */
+    int ctx_rc = st->api.ctx_create(&ob_cfg, &st->ob_ctx);
+    if ((ctx_rc != 0 || !st->ob_ctx) && !ob_cfg.mock_mode) {
+      st->ob_ctx = nullptr;
+      if (!st->cfg.allow_mock_fallback) {
+        return FS_ERR_NO_BACKEND;
+      }
+      ob_cfg.mock_mode = 1;
+      ctx_rc           = st->api.ctx_create(&ob_cfg, &st->ob_ctx);
+    }
+
+    if (ctx_rc == 0 && st->ob_ctx) {
+      st->hw_active = (!ob_cfg.mock_mode) ? 1 : 0;
       if (st->api.set_profile) {
         (void)st->api.set_profile(st->ob_ctx, 1);
       }
@@ -456,6 +483,15 @@ static fs_status_t fs_openbuenos_init(void* user_data, const fs_topology_t* topo
         }
       }
     }
+  } else {
+#ifdef __linux__
+    if (!is_mock_topo) {
+      st->tpu_dev_fd = open(dev_path, O_RDWR | O_CLOEXEC);
+      st->hw_active  = (st->tpu_dev_fd >= 0) ? 1 : 0;
+    }
+#else
+    (void)dev_path;
+#endif
   }
 
   if (!st->hw_active && !st->cfg.allow_mock_fallback) {
@@ -536,31 +572,51 @@ static fs_status_t fs_openbuenos_import_dmabuf(void* user_data, fs_dmabuf_t* buf
     fs_ob_ensure_immutable_locked(st, buf);
   }
 
-#ifdef __linux__
-  if (st->tpu_dev_fd >= 0 &&
-      (buf->backing == FS_BACKING_DMA_HEAP || buf->backing == FS_BACKING_IMPORTED) &&
+  if ((buf->backing == FS_BACKING_DMA_HEAP || buf->backing == FS_BACKING_IMPORTED) &&
       buf->dmabuf_fd >= 0) {
-    struct fs_edgetpu_map_dmabuf_ioctl req;
-    std::memset(&req, 0, sizeof(req));
-    req.offset    = static_cast<uint64_t>(buf->offset);
-    req.size      = static_cast<uint64_t>(buf->size);
-    req.dmabuf_fd = static_cast<int32_t>(buf->dmabuf_fd);
-    req.flags     = FS_EDGETPU_MAP_BIDIRECTIONAL | FS_EDGETPU_MAP_36BIT_IOVA;
-    req.die_index = 0u;
-    int rc        = 0;
-    do {
-      rc = ioctl(st->tpu_dev_fd, FS_EDGETPU_MAP_DMABUF, &req);
-    } while (rc != 0 && errno == EINTR);
-    if (rc != 0) {
-      if (!st->cfg.allow_mock_fallback) {
-        return FS_ERR_IOCTL;
+    if (st->ob_ctx) {
+      if (!st->api.dmabuf_map) {
+        if (!st->cfg.allow_mock_fallback) {
+          return FS_ERR_IOCTL;
+        }
+      } else {
+        uint64_t mapped_iova = 0u;
+        const int map_rc = st->api.dmabuf_map(
+            st->ob_ctx, buf->dmabuf_fd, static_cast<uint64_t>(buf->offset),
+            static_cast<uint64_t>(buf->size), 0u, &mapped_iova);
+        if (map_rc == 0 && mapped_iova != 0u) {
+          buf->tpu_iova = mapped_iova;
+          return FS_OK;
+        }
+        if (!st->cfg.allow_mock_fallback) {
+          return FS_ERR_IOCTL;
+        }
       }
-    } else {
-      buf->tpu_iova = req.device_address;
-      return FS_OK;
     }
-  }
+#ifdef __linux__
+    else if (st->tpu_dev_fd >= 0) {
+      struct fs_edgetpu_map_dmabuf_ioctl req;
+      std::memset(&req, 0, sizeof(req));
+      req.offset    = static_cast<uint64_t>(buf->offset);
+      req.size      = static_cast<uint64_t>(buf->size);
+      req.dmabuf_fd = static_cast<int32_t>(buf->dmabuf_fd);
+      req.flags     = FS_EDGETPU_MAP_BIDIRECTIONAL | FS_EDGETPU_MAP_36BIT_IOVA;
+      req.die_index = 0u;
+      int rc        = 0;
+      do {
+        rc = ioctl(st->tpu_dev_fd, FS_EDGETPU_MAP_DMABUF, &req);
+      } while (rc != 0 && errno == EINTR);
+      if (rc != 0) {
+        if (!st->cfg.allow_mock_fallback) {
+          return FS_ERR_IOCTL;
+        }
+      } else {
+        buf->tpu_iova = req.device_address;
+        return FS_OK;
+      }
+    }
 #endif
+  }
 
   if (buf->tpu_iova == 0u) {
     buf->tpu_iova = 0x100000000ULL + (buf->buf_id << 20);
@@ -577,20 +633,24 @@ static void fs_openbuenos_release_dmabuf(void* user_data, fs_dmabuf_t* buf) {
     std::lock_guard<std::mutex> lk(st->mu);
     fs_ob_unreg_immutable_locked(st, buf);
   }
-#ifdef __linux__
-  if (st->tpu_dev_fd >= 0 &&
-      (buf->backing == FS_BACKING_DMA_HEAP || buf->backing == FS_BACKING_IMPORTED) &&
+  if ((buf->backing == FS_BACKING_DMA_HEAP || buf->backing == FS_BACKING_IMPORTED) &&
       buf->dmabuf_fd >= 0 && buf->tpu_iova != 0u) {
-    struct fs_edgetpu_map_dmabuf_ioctl req;
-    std::memset(&req, 0, sizeof(req));
-    req.offset         = static_cast<uint64_t>(buf->offset);
-    req.size           = static_cast<uint64_t>(buf->size);
-    req.device_address = buf->tpu_iova;
-    req.dmabuf_fd      = static_cast<int32_t>(buf->dmabuf_fd);
-    req.flags          = FS_EDGETPU_MAP_BIDIRECTIONAL | FS_EDGETPU_MAP_36BIT_IOVA;
-    (void)ioctl(st->tpu_dev_fd, FS_EDGETPU_UNMAP_DMABUF, &req);
-  }
+    if (st->ob_ctx && st->api.dmabuf_unmap) {
+      (void)st->api.dmabuf_unmap(st->ob_ctx, buf->tpu_iova);
+    }
+#ifdef __linux__
+    else if (st->tpu_dev_fd >= 0) {
+      struct fs_edgetpu_map_dmabuf_ioctl req;
+      std::memset(&req, 0, sizeof(req));
+      req.offset         = static_cast<uint64_t>(buf->offset);
+      req.size           = static_cast<uint64_t>(buf->size);
+      req.device_address = buf->tpu_iova;
+      req.dmabuf_fd      = static_cast<int32_t>(buf->dmabuf_fd);
+      req.flags          = FS_EDGETPU_MAP_BIDIRECTIONAL | FS_EDGETPU_MAP_36BIT_IOVA;
+      (void)ioctl(st->tpu_dev_fd, FS_EDGETPU_UNMAP_DMABUF, &req);
+    }
 #endif
+  }
   buf->tpu_iova = 0u;
 }
 

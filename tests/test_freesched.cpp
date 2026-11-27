@@ -1100,6 +1100,37 @@ static bool test_real_backend_adapters_and_dmabuf_sync() {
   fs_fence_close(&f_dir);
   fs_buffer_release(ctx, b_direct);
 
+  /* Imported external DMA-BUF fds map through ob_dmabuf_map cleanly and unmap on release */
+  std::vector<float> ext_in(K, 0.5f), ext_w(K * N, 1.0f), ext_out(N, 0.0f);
+  fs_dmabuf_t* b_ext_in  = nullptr;
+  fs_dmabuf_t* b_ext_w   = nullptr;
+  fs_dmabuf_t* b_ext_out = nullptr;
+  CHECK(fs_buffer_import_dmabuf(ctx, 17, K * sizeof(float), 0u, ext_in.data(), FS_DEV_TPU, 0u,
+                                &b_ext_in) == FS_OK);
+  CHECK(fs_buffer_import_dmabuf(ctx, 18, K * N * sizeof(float), 0u, ext_w.data(), FS_DEV_TPU,
+                                FS_BUF_IMMUTABLE_WEIGHT, &b_ext_w) == FS_OK);
+  CHECK(fs_buffer_import_dmabuf(ctx, 19, N * sizeof(float), 0u, ext_out.data(), FS_DEV_TPU, 0u,
+                                &b_ext_out) == FS_OK);
+  fs_op_desc_t ext_op;
+  std::memset(&ext_op, 0, sizeof(ext_op));
+  ext_op.type      = FS_OP_DECODE_GEMV;
+  ext_op.phase     = FS_PHASE_DECODE;
+  ext_op.m_dim     = 1u;
+  ext_op.k_dim     = K;
+  ext_op.n_dim     = N;
+  ext_op.act_dtype = FS_DTYPE_F32;
+  ext_op.weight_dtype = FS_DTYPE_F32;
+  ext_op.input_a   = b_ext_in;
+  ext_op.input_b   = b_ext_w;
+  ext_op.output    = b_ext_out;
+  CHECK(fs_execute_op(ctx, &ext_op, nullptr) == FS_OK);
+  CHECK(b_ext_in->tpu_iova != 0u);
+  CHECK(b_ext_w->tpu_iova != 0u && b_ext_w->tpu_iova != b_ext_in->tpu_iova);
+  CHECK(b_ext_out->tpu_iova != 0u && b_ext_out->tpu_iova != b_ext_w->tpu_iova);
+  fs_buffer_release(ctx, b_ext_in);
+  fs_buffer_release(ctx, b_ext_w);
+  fs_buffer_release(ctx, b_ext_out);
+
   fs_plan_destroy(plan);
   fs_context_destroy(ctx);
   return true;
