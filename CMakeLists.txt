@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.18)
 project(freesched VERSION 0.1.0 LANGUAGES C CXX)
 
 option(FREESCHED_BUILD_TESTS "Build freesched C11/C++17 tests and benchmark" ON)
+set(FREESCHED_OPENBUENOS_DIR "" CACHE PATH "Optional libopenbuenos root for direct EdgeTPU/FreeTile linkage")
+if (NOT FREESCHED_OPENBUENOS_DIR AND DEFINED OPENBUENOS_DIR AND NOT "${OPENBUENOS_DIR}" STREQUAL "")
+  set(FREESCHED_OPENBUENOS_DIR "${OPENBUENOS_DIR}")
+endif()
 
 add_library(freesched STATIC
   src/fs_topology.cpp
@@ -42,6 +46,27 @@ elseif (APPLE)
   target_link_libraries(freesched PUBLIC m)
 endif()
 
+if (FREESCHED_OPENBUENOS_DIR)
+  find_path(_FREESCHED_OB_INCLUDE openbuenos.h
+    PATHS "${FREESCHED_OPENBUENOS_DIR}/include"
+    NO_DEFAULT_PATH)
+  find_library(_FREESCHED_OB_LIB openbuenos
+    PATHS
+      "${FREESCHED_OPENBUENOS_DIR}/build/linux-arm64"
+      "${FREESCHED_OPENBUENOS_DIR}/build/host"
+      "${FREESCHED_OPENBUENOS_DIR}/build"
+      "${FREESCHED_OPENBUENOS_DIR}"
+    NO_DEFAULT_PATH)
+  if (_FREESCHED_OB_INCLUDE AND _FREESCHED_OB_LIB)
+    message(STATUS "freesched: linking static libopenbuenos (${_FREESCHED_OB_LIB})")
+    target_compile_definitions(freesched PRIVATE FREESCHED_HAVE_LIBOPENBUENOS=1)
+    target_include_directories(freesched PRIVATE "${_FREESCHED_OB_INCLUDE}")
+    target_link_libraries(freesched PUBLIC "${_FREESCHED_OB_LIB}")
+  else()
+    message(FATAL_ERROR "FREESCHED_OPENBUENOS_DIR='${FREESCHED_OPENBUENOS_DIR}' missing openbuenos.h or libopenbuenos")
+  endif()
+endif()
+
 add_executable(freesched_dmabuf_smoke tools/freesched_dmabuf_smoke.cpp)
 target_link_libraries(freesched_dmabuf_smoke PRIVATE freesched)
 target_compile_features(freesched_dmabuf_smoke PRIVATE cxx_std_17)
@@ -54,7 +79,7 @@ target_compile_options(pocketcoder-run PRIVATE -Wall -Wextra -Werror -fno-except
 
 if (FREESCHED_BUILD_TESTS)
   enable_testing()
-  add_test(NAME freesched_dmabuf_smoke COMMAND freesched_dmabuf_smoke --profile laguna --json)
+  add_test(NAME freesched_dmabuf_smoke COMMAND freesched_dmabuf_smoke --profile laguna --mock --json)
   add_test(NAME pocketcoder_run_bench_synthetic COMMAND pocketcoder-run --bench-synthetic --iters 20)
 
   add_executable(test_c11_abi tests/test_c11_abi.c)
@@ -78,6 +103,9 @@ if (FREESCHED_BUILD_TESTS)
   target_compile_features(test_pocketcoder PRIVATE cxx_std_17)
   target_compile_options(test_pocketcoder PRIVATE -Wall -Wextra -Werror -fno-exceptions -fno-rtti)
   add_test(NAME test_pocketcoder COMMAND test_pocketcoder)
+
+  set_tests_properties(test_c11_abi test_freesched test_pocketcoder
+    PROPERTIES ENVIRONMENT "FREESCHED_MOCK=1")
 
   add_executable(bench_heterogeneous tests/bench_heterogeneous.cpp)
   target_link_libraries(bench_heterogeneous PRIVATE freesched)

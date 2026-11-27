@@ -306,6 +306,10 @@ typedef struct pc_graph_config {
   uint32_t        hidden_dim;      /* 2304 for PocketCoder-13B-A3B */
   uint32_t        expert_ffn_dim;  /* 1152 for PocketCoder-13B-A3B */
   uint32_t        dspark_max_dup;  /* 3 or 4 */
+  const char*     dive_interp_path;/* Optional external RV64 DIVE interpreter path */
+  int             require_tpu_hw;  /* 1 = fail closed if /dev/edgetpu-soc or DIVE unavailable */
+  uint8_t         perf_mode;       /* 0..5 DVFS perf tier (default 5) */
+  uint8_t         reserved[3];
 } pc_graph_config_t;
 
 typedef struct pc_graph_stats {
@@ -320,6 +324,17 @@ typedef struct pc_graph_stats {
   uint64_t dma_sync_calls;
   double   max_abs_err;
   double   nmse;
+  int      ob_hw_active;
+  int      ob_emitter_active;
+  int      ob_freetile_active;
+  uint64_t ob_calls;
+  uint64_t ob_tiles_dispatched;
+  uint64_t ob_hw_us;
+  uint64_t ob_w_hits;
+  uint64_t ob_w_misses;
+  uint64_t ob_w_evictions;
+  uint64_t ob_weight_pack_us;
+  uint64_t ob_weight_cache_bytes;
 } pc_graph_stats_t;
 
 typedef struct pc_graph pc_graph_t;
@@ -327,6 +342,23 @@ typedef struct pc_graph pc_graph_t;
 pc_graph_config_t pc_graph_config_default(void);
 fs_status_t       pc_graph_create(const pc_graph_config_t* cfg, pc_graph_t** out_graph);
 void              pc_graph_destroy(pc_graph_t* graph);
+
+/*
+ * Uploads immutable Q4_0 + RMSNorm weights ONCE into reconciled DMA-BUFs,
+ * registers the immutable region, and prepacks EdgeTPU ext[2] tiles/graphs
+ * upfront so decode steps incur zero runtime weight copying or repacking.
+ */
+fs_status_t pc_graph_bind_weights(pc_graph_t*  graph,
+                                  const void*  w_q4_0,
+                                  const float* rms_weight);
+
+/*
+ * Executes one pre-baked step against weights already bound via pc_graph_bind_weights.
+ */
+fs_status_t pc_graph_step_bound(pc_graph_t*       graph,
+                                const float*      x_in,
+                                float*            y_out,
+                                pc_graph_stats_t* out_stats);
 
 /*
  * Executes one pre-baked heterogeneous layer step:

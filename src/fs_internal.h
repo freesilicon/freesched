@@ -73,7 +73,10 @@ fs_status_t fs_install_builtin_backends(fs_context_t* ctx);
 void        fs_shutdown_backends(fs_context_t* ctx);
 fs_status_t fs_ref_execute_any_internal(const fs_op_desc_t* op);
 
-/* Router internal helper */
+/* Router & topology internal helpers */
+fs_status_t fs_topology_probe_mode(fs_hw_profile_t profile_hint,
+                                   int             force_mock,
+                                   fs_topology_t*  out_topo);
 int fs_backend_supports_op_internal(const fs_context_t* ctx,
                                     fs_dev_t            dev,
                                     const fs_op_desc_t* op);
